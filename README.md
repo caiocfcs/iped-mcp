@@ -64,9 +64,18 @@ no código, as funções do domínio core não levam o prefixo).
 | `iped_bookmarks_save_search` | Executa uma busca Lucene e salva os resultados num bookmark |
 | `iped_bookmarks_report` | Amostra de documentos de um bookmark com propriedades-chave |
 | `iped_bookmarks_download` | Baixa todos os arquivos de um bookmark para uma pasta local |
+| `iped_bookmarks_download_info` | Exporta todas as informações textuais estruturadas de um bookmark para um arquivo JSON |
 | `iped_bookmarks_create_from_file` | Cria um bookmark a partir de um txt (1 doc ID ou MD5 por linha) |
 | `iped_bookmarks_add_from_file` | Adiciona a um bookmark os docs de um txt |
 | `iped_bookmarks_remove_from_file` | Remove de um bookmark os docs de um txt |
+| `iped_whatsapp_overview` | Triagem do WhatsApp no source: totais, período, série mensal, conversas distintas e top interlocutores |
+| `iped_whatsapp_account` | Conta do dono do WhatsApp: JID, número, nome de exibição e status |
+| `iped_whatsapp_profile_photo` | Baixa a foto de perfil cacheada de um número (dono ou interlocutor) |
+| `iped_whatsapp_conversation` | Analisa uma conversa privada: volume total, período, intensidade e divisão enviado/recebido |
+| `iped_whatsapp_conversation_window` | Analisa uma conversa privada numa janela de tempo, segmentada por tipo (texto, áudio, imagem, vídeo, PDF) |
+| `iped_whatsapp_export_conversation` | Exporta as mensagens de uma conversa privada para um JSON local (texto, transcrição de áudio, texto de PDF) |
+| `iped_whatsapp_text_search` | Busca um termo em todas as conversas privadas (corpo da mensagem, transcrição de áudio e texto de PDF) |
+| `iped_whatsapp_reference` | Referência validada de campos, padrões de name, marcadores de tipo e queries canônicas do WhatsApp |
 
 Campos `ufed:` indexados: `EntryName`, `EntryValue`, `EntryCategory`, `Source`,
 `extractionName`, `Name`, `URL`, `ChangeTime`, `decoding_confidence`, `isrelated`,
@@ -82,6 +91,7 @@ Campos `ufed:` indexados: `EntryName`, `EntryValue`, `EntryCategory`, `Source`,
 - `src/iped_mcp/ufed/` — tools de atributos `ufed:` (`tool.py`, `queries.py`)
 - `src/iped_mcp/regex/` — tools de atributos `Regex:*` (`tool.py`, `queries.py`, `scan.py`)
 - `src/iped_mcp/bookmarks/` — tools de bookmarks (`tool.py`, `download.py`, `idsfile.py`)
+- `src/iped_mcp/whatsapp/` — tools de WhatsApp (`tool.py`, `queries.py`, `collect.py`)
 - `tests/` — testes unitários e de integração (integração pula se o IPED estiver fora)
 
 ## Setup
