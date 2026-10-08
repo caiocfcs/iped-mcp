@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+test_venv
+
+# Environment variables
+.env
+
+# CSV exports das tools regex
+exports/
+
+# Pastas tmp
+tmp/
