@@ -8,6 +8,7 @@ LLM e nenhum acesso a arquivos do caso.
 
 from fastmcp import FastMCP
 
+from iped_mcp.triage.identity import register as register_identity
 from iped_mcp.triage.telephony import register as register_telephony
 from iped_mcp.triage.transcripts import register as register_transcripts
 
@@ -18,6 +19,7 @@ def register(mcp: FastMCP) -> None:
     Args:
         mcp: servidor FastMCP ativo.
     """
+    register_identity(mcp)
     register_telephony(mcp)
     register_transcripts(mcp)
 
