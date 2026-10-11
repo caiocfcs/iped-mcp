@@ -8,6 +8,7 @@ from iped_mcp.bookmarks import register as register_bookmarks
 from iped_mcp.core import register as register_core
 from iped_mcp.regex import register as register_regex
 from iped_mcp.router import RouterStartupError, get_router
+from iped_mcp.triage import register as register_triage
 from iped_mcp.ufed import register as register_ufed
 from iped_mcp.whatsapp import register as register_whatsapp
 
@@ -42,7 +43,10 @@ mcp = FastMCP(
         "privada (volume, intensidade, janela por tipo), whatsapp_export_conversation "
         "grava o JSON da conversa no disco, whatsapp_text_search busca um termo em "
         "mensagem/áudio/PDF e whatsapp_profile_photo baixa o avatar de um número. "
-        "whatsapp_reference documenta os campos e queries canônicas validados."
+        "whatsapp_reference documenta os campos e queries canônicas validados. "
+        "A família triage_ traz triagem pronta sem LLM: triage_telephony agrega "
+        "chamadas/contatos por número e devolve o top contatos com score e "
+        "relevância (tetos e truncamento sempre marcados na resposta)."
     ),
 )
 
@@ -51,6 +55,7 @@ register_ufed(mcp)
 register_regex(mcp)
 register_bookmarks(mcp)
 register_whatsapp(mcp)
+register_triage(mcp)
 
 
 def main() -> None:
