@@ -422,3 +422,20 @@ def fake_router(webapi: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     router = router_mod.Router({"default": webapi.base_url})
     monkeypatch.setattr(router_mod, "_router", router)
     return router
+
+
+@pytest.fixture(autouse=True)
+def _sem_backoff_real(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zera o backoff padrão do client para a suíte não dormir de verdade.
+
+    A política continua valendo (tentativas e decisões não mudam); só a
+    espera real é substituída. Testes de resiliência injetam `sleeper`/
+    `clock` próprios e não são afetados (injeção tem precedência).
+    """
+    import time as real_time
+    from types import SimpleNamespace
+
+    import iped_mcp.client as client_mod
+
+    stub = SimpleNamespace(sleep=lambda _s: None, monotonic=real_time.monotonic)
+    monkeypatch.setattr(client_mod, "time", stub)

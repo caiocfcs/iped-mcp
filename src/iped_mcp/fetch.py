@@ -1,4 +1,11 @@
-"""Busca + fetch paralelo de docs e cache em memória (compartilhado entre domínios)."""
+"""Busca + fetch paralelo de docs e cache em memória (compartilhado entre domínios).
+
+Resiliência (M-3): o retry de falha transitória é política do CLIENT
+(`iped_mcp.resilience`, aplicada a TODOS os chamados); este módulo faz uma
+única chamada por operação e trata apenas a falha PERMANENTE — doc
+inexistente vira `None` (não derruba lote) e 500 de query no /search vira
+diagnóstico imediato (AC4: sem esperar tentativas).
+"""
 
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ import requests
 
 from iped_mcp.config import WORKERS
 from iped_mcp.diagnose import diagnose_500
+from iped_mcp.errors import IpedError, ServerError
 from iped_mcp.router import get_router
 
 _CACHE_TTL = 300.0
@@ -24,6 +32,12 @@ _TEXT_CACHE_TTL = 300.0
 _TEXT_CACHE_MAX_CHARS = 256 * 1024 * 1024  # 256 MB
 _text_cache: dict[tuple[str, int], tuple[float, tuple[str, int, bool]]] = {}
 _text_cache_lock = threading.Lock()
+
+# Falha esperada das rotas roteadas: `IpedError` (taxonomia do client, já
+# com retry esgotado), `ValueError` (tradução centrada em source do router)
+# e `requests.RequestException` (defensivo — os erros da taxonomia herdam
+# dela). Todas viram o contrato de "falhou" de cada função abaixo.
+_EXPECTED_FAILURES = (IpedError, ValueError, requests.RequestException)
 
 
 def text_cache_get(source_id: str, doc_id: int) -> tuple[str, int, bool] | None:
@@ -69,92 +83,74 @@ def search_ids(
     source_id: str,
     hint: str,
     timeout: float | None = None,
-    attempts: int = 3,
 ) -> list[int]:
     """Busca no IPED e devolve a lista achatada de doc ids.
 
-    Falhas transitórias (conexão, timeout) são retried antes de desistir;
-    HTTP 500 (sintaxe da query) falha na hora com o diagnóstico.
+    Uma única chamada: o retry de falha transitória (conexão/timeout) é do
+    client (M-3) e chega aqui já traduzido pelo router em ValueError com
+    texto estável ("Source 'x' indisponível"). HTTP 500 no /search = query
+    rejeitada (determinística): falha NA HORA com o diagnóstico, sem
+    esperar tentativas (AC4 — semântica pré-M-3 preservada).
+
+    Args:
+        query: query Lucene.
+        source_id: source roteada.
+        hint: frase final do diagnóstico de 500 (contexto da tool).
+        timeout: timeout desta chamada.
+
+    Returns:
+        Doc ids achatados (ordem dos grupos do servidor).
+
+    Raises:
+        ValueError: query rejeitada (500) ou source indisponível/inexistente.
     """
     client = get_router()
-    last_exc: Exception | None = None
-    for i in range(attempts):
-        try:
-            results = client.search(query, source_id=source_id, timeout=timeout)
-            return [doc_id for group in results for doc_id in group.get("ids", [])]
-        except requests.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 500:
-                raise ValueError(diagnose_500(query, hint)) from exc
-            last_exc = exc
-        except requests.RequestException as exc:
-            last_exc = exc
-        except ValueError as exc:
-            # o router converte ConnectionError/Timeout em ValueError centrado
-            # em source; com paralelismo alto essas falhas transitórias são
-            # mais frequentes — trata como retry.
-            last_exc = exc
-        if i < attempts - 1:
-            time.sleep(1.0 * (2**i))
-    raise ValueError(
-        f"Source '{source_id}' indisponível: o servidor correspondente "
-        "não responde."
-    ) from last_exc
+    try:
+        results = client.search(query, source_id=source_id, timeout=timeout)
+    except ServerError as exc:
+        raise ValueError(diagnose_500(query, hint)) from exc
+    except IpedError as exc:
+        # Defensivo: no fluxo roteado o router já converteu em ValueError.
+        raise ValueError(str(exc)) from exc
+    return [doc_id for group in results for doc_id in group.get("ids", [])]
 
 
-def _retry(fn, attempts: int = 3):
-    """Executa fn() com retry em falhas transitórias (5xx, conexão, timeout).
+def get_document_props(source_id: str, doc_id: int) -> dict | None:
+    """GET /docs/{id} → properties; None em doc inexistente/falha permanente.
 
-    Devolve o resultado de fn(); None em falha permanente (4xx) ou esgotado.
+    O retry de falha transitória é do client (M-3); a falha esperada (doc
+    removido, 500 persistente) vira None e não derruba o lote.
     """
-    for i in range(attempts):
-        try:
-            return fn()
-        except requests.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else None
-            if status is not None and 400 <= status < 500:
-                return None
-        except (requests.ConnectionError, requests.Timeout):
-            pass
-        except ValueError:
-            # o router converte ConnectionError/Timeout em ValueError centrado
-            # em source; com paralelismo alto essas falhas transitórias são
-            # mais frequentes — trata como retry (não derruba o lote).
-            pass
-        except requests.RequestException:
-            return None
-        if i < attempts - 1:
-            time.sleep(0.5 * (2**i))
-    return None
-
-
-def get_document_props(source_id: str, doc_id: int, attempts: int = 3) -> dict | None:
-    """GET /docs/{id} → properties (com retry); None em doc inexistente/falha."""
     client = get_router()
-    doc = _retry(lambda: client.get_document(source_id, doc_id), attempts)
+    try:
+        doc = client.get_document(source_id, doc_id)
+    except _EXPECTED_FAILURES:
+        return None
     return doc.get("properties", {}) if doc is not None else None
 
 
 def get_document_text_cached(
-    source_id: str, doc_id: int, attempts: int = 3
+    source_id: str, doc_id: int
 ) -> tuple[str, int, bool] | None:
-    """GET /docs/{id}/text → (text, total_chars, capped) com cache + retry.
+    """GET /docs/{id}/text → (text, total_chars, capped) com cache.
 
-    None em falha permanente (4xx) ou retry esgotado.
+    None em falha permanente (doc inexistente/esgotado — retry é do client).
     """
     cached = text_cache_get(source_id, doc_id)
     if cached is not None:
         return cached
     client = get_router()
-    result = _retry(lambda: client.get_document_text(source_id, doc_id), attempts)
-    if result is None:
+    try:
+        result = client.get_document_text(source_id, doc_id)
+    except _EXPECTED_FAILURES:
         return None
     text_cache_set(source_id, doc_id, result)
     return result
 
 
-def get_document_text(source_id: str, doc_id: int, attempts: int = 3) -> str | None:
-    """GET /docs/{id}/text → texto (cache + retry); None em falha/esgotado."""
-    result = get_document_text_cached(source_id, doc_id, attempts)
+def get_document_text(source_id: str, doc_id: int) -> str | None:
+    """GET /docs/{id}/text → texto (com cache); None em falha/esgotado."""
+    result = get_document_text_cached(source_id, doc_id)
     if result is None:
         return None
     return result[0]
@@ -166,7 +162,7 @@ def fetch_docs_parallel(
     """Busca documentos em paralelo; devolve (doc_id, properties) na ordem dos ids.
 
     Doc que falhar (ex.: removido) vira (doc_id, None) e não derruba o lote;
-    falhas transitórias (5xx, conexão, timeout) são retried antes de desistir.
+    falhas transitórias já foram re-tentadas pelo client (M-3).
     """
 
     def _fetch(doc_id: int) -> tuple[int, dict | None]:
