@@ -18,7 +18,7 @@ from iped_mcp.bookmarks.download import _first, download_bookmark, flatten_group
 from iped_mcp.bookmarks.export_info import export_bookmark_info
 from iped_mcp.bookmarks.idsfile import read_ids_or_hashes_file
 from iped_mcp.config import WORKERS
-from iped_mcp.diagnose import diagnose_500
+from iped_mcp.diagnose import guarded_call
 from iped_mcp.lucene import quote_value
 from iped_mcp.router import get_router
 
@@ -358,16 +358,11 @@ def bookmarks_save_search(
     if not 1 <= limit <= _SAVE_SEARCH_LIMIT_MAX:
         raise ValueError(f"limit deve estar entre 1 e {_SAVE_SEARCH_LIMIT_MAX}.")
     client = get_router()
-    try:
-        results = client.search(query, source_id=source_id)
-    except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 500:
-            raise ValueError(diagnose_500(query, _SEARCH_HINT)) from exc
-        raise
-    except requests.ConnectionError as exc:
-        raise ValueError(
-            "Servidor IPED indisponível. Verifique se o IPED está rodando."
-        ) from exc
+    # Politica unica de erro (M-2): guard compartilhado; 500 → diagnose com a
+    # query montada; rede/timeout/404 → textos estáveis de iped_mcp.errors.
+    results = guarded_call(
+        client.search, query, _SEARCH_HINT, query, source_id=source_id
+    )
     flat = flatten_groups(results)
     total_matches = len(flat)
     to_save = flat[:limit]

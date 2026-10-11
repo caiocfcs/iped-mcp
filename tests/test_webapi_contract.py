@@ -5,6 +5,11 @@ realmente devolveu (vereditos WI-x). Testes marcados
 ``characterization`` registram comportamento HOJE-questionavel (doc->500,
 404 cru que vaza) que M-2/M-8 vao trocar deliberadamente -- troque o pino
 juntamente com a mudanca, nunca "conserte" o teste isoladamente.
+
+M-2 (Design 02) aplicado: o client agora traduz TODO erro em
+``iped_mcp.errors`` (sem texto requests cru); os pinos abaixo ja refletem
+a taxonomia, mantendo o veredito de STATUS do jar (source->404,
+doc->500) e a compatibilidade de classes (hierarquia herda de requests).
 """
 
 from __future__ import annotations
@@ -13,7 +18,8 @@ import json
 from typing import Any
 
 import pytest
-import requests
+
+from iped_mcp import errors
 
 from tests.conftest import (
     ALL_DOC_IDS,
@@ -114,16 +120,19 @@ def test_search_body_has_no_total_field(client: Any, webapi: Any) -> None:
 
 
 @pytest.mark.characterization
-def test_search_unknown_source_raises_404_raw(client: Any) -> None:
-    """#2-wi3: source inexistente -> 404 text/plain cru (DIVERGE, WI-3).
+def test_search_unknown_source_raises_not_found(client: Any) -> None:
+    """#2-wi3: source inexistente -> ResourceNotFoundError (HTTP 404).
 
-    Characterization: o client NAO traduz; M-2 deve trocar HTTPError cru
-    por excecao propria com contexto (Design 02 AC2).
+    M-2 pinado: excecao propria com contexto (AC2/AC4); o jar ainda
+    responde 404 text/plain (WI-3/P2-1), mas o texto requests cru nao vaza.
     """
-    with pytest.raises(requests.HTTPError) as exc:
+    with pytest.raises(errors.ResourceNotFoundError) as exc:
         client.search("*", source_id=UNKNOWN_SOURCE)
-    assert exc.value.response.status_code == 404
+    assert exc.value.status_code == 404
+    assert exc.value.source_id == UNKNOWN_SOURCE
+    assert exc.value.response is not None
     assert exc.value.response.text.startswith("source not found:")
+    assert "for url:" not in str(exc.value)
 
 
 def test_md5_search_resolves_doc_id(client: Any) -> None:
@@ -159,23 +168,30 @@ def test_get_document_injects_source_id_unquoted(client: Any, webapi: Any) -> No
 
 
 @pytest.mark.characterization
-def test_get_document_missing_raises_500_grizzly(client: Any, webapi: Any) -> None:
-    """#3-wi3: doc inexistente -> 500 HTML Grizzly, NAO 404 (2d 10).
+def test_get_document_missing_raises_server_error(client: Any, webapi: Any) -> None:
+    """#3-wi3: doc inexistente -> ServerError (jar responde 500 Grizzly, NAO 404).
 
-    Characterization: o core depende do 500 para o diagnose_500
-    (core/tool.py:34-37,62-78); M-8/M-2 podem reclassificar.
+    M-2 pinado: 5xx chega como CLASSE DISTINTA de 404 (AC4, habilita
+    M-3/M-8); mensagem com prefixo estavel "Doc nao encontrado" (AC5); a
+    Response com o HTML Grizzly segue anexada (M-8 consome o corpo).
     """
-    with pytest.raises(requests.HTTPError) as exc:
+    with pytest.raises(errors.ServerError) as exc:
         client.get_document(SOURCE_ID, MISSING_DOC_ID)
-    assert exc.value.response.status_code == 500
+    assert exc.value.status_code == 500
+    assert str(exc.value).startswith("Doc não encontrado")
+    assert "for url:" not in str(exc.value)
+    assert exc.value.response is not None
     assert GRIZZLY_500[:32] in exc.value.response.content
 
 
-def test_get_document_unknown_source_raises_404(client: Any) -> None:
-    """#3: source inexistente no path -> 404 text/plain (P2-1 lado source)."""
-    with pytest.raises(requests.HTTPError) as exc:
+def test_get_document_unknown_source_raises_not_found(client: Any) -> None:
+    """#3: source inexistente no path -> ResourceNotFoundError 404 (P2-1).
+
+    M-2: 404 de SOURCE nao vira "Doc nao encontrado" — o 404 significa
+    "nao existe" no path (fonte), independente de doc_id."""
+    with pytest.raises(errors.ResourceNotFoundError) as exc:
         client.get_document(UNKNOWN_SOURCE, DOC_TEXT_ID)
-    assert exc.value.response.status_code == 404
+    assert exc.value.status_code == 404
 
 
 # --- #4/#5 GET /bookmarks[/nome] (list_bookmarks, get_bookmark_docs) --------
@@ -280,11 +296,12 @@ def test_content_without_disposition_header_yields_empty_filename(client: Any) -
 
 
 @pytest.mark.characterization
-def test_content_missing_doc_raises_500(client: Any) -> None:
-    """#11: doc inexistente -> 500 cru (mesmofixture Grizzly do #3)."""
-    with pytest.raises(requests.HTTPError) as exc:
+def test_content_missing_doc_raises_server_error(client: Any) -> None:
+    """#11: doc inexistente -> ServerError traduzida (mesmo fixture Grizzly do #3)."""
+    with pytest.raises(errors.ServerError) as exc:
         client.get_document_content(SOURCE_ID, MISSING_DOC_ID)
-    assert exc.value.response.status_code == 500
+    assert exc.value.status_code == 500
+    assert str(exc.value).startswith("Doc não encontrado")
 
 
 # --- #12 GET /text (client.get_document_text) --------------------------------
@@ -306,18 +323,22 @@ def test_text_stops_at_max_bytes_and_flags_capped(client: Any) -> None:
 
 
 @pytest.mark.characterization
-def test_text_missing_doc_raises_500(client: Any) -> None:
-    """#12: /text de doc inexistente -> 500 (2d: /text 200/500/404)."""
-    with pytest.raises(requests.HTTPError) as exc:
+def test_text_missing_doc_raises_server_error(client: Any) -> None:
+    """#12: /text de doc inexistente -> ServerError 500 (2d: /text 200/500/404).
+
+    M-2 mantem 500 como ServerError (classe propria, nao ValueError): e o
+    gancho do M-8 para tratar status-como-dado neste endpoint."""
+    with pytest.raises(errors.ServerError) as exc:
         client.get_document_text(SOURCE_ID, MISSING_DOC_ID)
-    assert exc.value.response.status_code == 500
+    assert exc.value.status_code == 500
+    assert exc.value.response is not None
 
 
-def test_text_unknown_source_raises_404(client: Any) -> None:
-    """#12: /text com source inexistente -> 404 text/plain (P2-1)."""
-    with pytest.raises(requests.HTTPError) as exc:
+def test_text_unknown_source_raises_not_found(client: Any) -> None:
+    """#12: /text com source inexistente -> ResourceNotFoundError 404 (P2-1)."""
+    with pytest.raises(errors.ResourceNotFoundError) as exc:
         client.get_document_text(UNKNOWN_SOURCE, DOC_TEXT_ID)
-    assert exc.value.response.status_code == 404
+    assert exc.value.status_code == 404
 
 
 # --- #13 GET /thumb (client.get_document_thumb) -------------------------------
@@ -337,8 +358,8 @@ def test_thumb_empty_body_means_no_image(client: Any) -> None:
 
 
 @pytest.mark.characterization
-def test_thumb_missing_doc_raises_500(client: Any) -> None:
-    """#13: doc inexistente -> 500 Grizzly."""
-    with pytest.raises(requests.HTTPError) as exc:
+def test_thumb_missing_doc_raises_server_error(client: Any) -> None:
+    """#13: doc inexistente -> ServerError (jar: 500 Grizzly)."""
+    with pytest.raises(errors.ServerError) as exc:
         client.get_document_thumb(SOURCE_ID, MISSING_DOC_ID)
-    assert exc.value.response.status_code == 500
+    assert exc.value.status_code == 500

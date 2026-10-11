@@ -13,12 +13,12 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Callable
+from typing import Any
 
 import requests
 from fastmcp import FastMCP
 
-from iped_mcp.diagnose import diagnose_500
+from iped_mcp.diagnose import guarded_call
 from iped_mcp.download import resolve_filename
 from iped_mcp.fetch import text_cache_get, text_cache_set
 from iped_mcp.router import get_router
@@ -59,23 +59,7 @@ def _first(value: object) -> object:
     return value
 
 
-def _guarded(fn: Callable, what: str, hint: str, *args: Any, **kwargs: Any) -> Any:
-    """Executa fn e traduz HTTP 500 / erro de rede em ValueError com diagnóstico."""
-    try:
-        return fn(*args, **kwargs)
-    except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 500:
-            raise ValueError(diagnose_500(what, hint)) from exc
-        raise
-    except requests.ConnectionError as exc:
-        raise ValueError(
-            "Servidor IPED indisponível. Verifique se o IPED está rodando."
-        ) from exc
-    except requests.Timeout as exc:
-        raise ValueError(
-            f"Timeout ao consultar o IPED ({what}). "
-            "Buscas amplas (ex.: match-all) podem demorar; refine a query."
-        ) from exc
+# Tradução de erros: política única em iped_mcp.diagnose.guarded_call (M-2).
 
 
 def _prepare_dest_dir(dest_dir: str) -> tuple[str, bool]:
@@ -129,19 +113,37 @@ _SOURCES_TTL = 30.0
 _sources_cache: tuple[float, list[dict[str, Any]]] | None = None
 
 
-def list_sources() -> list[dict[str, Any]]:
-    """Lista os sources registrados no servidor IPED.
+def list_sources() -> dict[str, Any]:
+    """Lista os sources registrados no servidor IPED e reporta servidores mudos.
 
     Comece por aqui para ver os sources disponíveis antes de buscar.
     Cada source tem `id` (use em source_id das outras tools) e `path`.
+    Servidor que não respondeu NÃO aparece em `sources` (não há como listar
+    suas fontes); a falha aparece em `offline_endpoints` como dado — uma
+    lista vazia com servidores offline nunca é silenciosa.
+
+    Returns:
+        {"sources": [{id, path}, ...],
+         "offline_endpoints": [{"endpoint": id, "error": motivo}, ...]} —
+         `offline_endpoints` vazio quando todos os servidores responderam.
+
+    Raises:
+        ValueError: falha inesperada de comunicação (taxonomia M-2).
     """
     global _sources_cache
     now = time.monotonic()
     if _sources_cache is not None and now - _sources_cache[0] < _SOURCES_TTL:
         return _sources_cache[1]
-    sources = get_router().list_sources()
-    _sources_cache = (now, sources)
-    return sources
+    sources, failures = get_router().list_sources_status()
+    result: dict[str, Any] = {
+        "sources": sources,
+        "offline_endpoints": [
+            {"endpoint": eid, "error": reason}
+            for eid, reason in sorted(failures.items())
+        ],
+    }
+    _sources_cache = (now, result)
+    return result
 
 
 def search(
@@ -210,7 +212,7 @@ def search(
         parts.extend(f.strip() for f in extra_filters if f and f.strip())
     final_query = " AND ".join(parts)
     client = get_router()
-    results = _guarded(
+    results = guarded_call(
         client.search,
         f"GET /search?q={final_query!r}",
         _SEARCH_HINT,
@@ -255,7 +257,7 @@ def doc_info(
         all: true → properties completo (padrão false).
     """
     client = get_router()
-    doc = _guarded(
+    doc = guarded_call(
         client.get_document,
         f"GET /sources/{source_id}/docs/{doc_id}",
         _DOC_HINT,
@@ -306,10 +308,10 @@ def doc_text(
     if cached is not None:
         text, total_chars, capped = cached
     else:
-        # _guarded preserva o diagnóstico de erro (500 → ValueError); o cache
+        # guarded_call preserva o diagnóstico de erro (500 → ValueError); o cache
         # só armazena resultados bem-sucedidos.
         client = get_router()
-        text, total_chars, capped = _guarded(
+        text, total_chars, capped = guarded_call(
             client.get_document_text,
             f"GET /sources/{source_id}/docs/{doc_id}/text",
             _DOC_HINT,
@@ -364,7 +366,7 @@ def doc_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
     """
     target, is_abs = _prepare_dest_dir(dest_dir)
     client = get_router()
-    header_filename, resp = _guarded(
+    header_filename, resp = guarded_call(
         client.get_document_content,
         f"GET /sources/{source_id}/docs/{doc_id}/content",
         _DOC_HINT,
@@ -432,7 +434,7 @@ def thumb_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
     """
     target, is_abs = _prepare_dest_dir(dest_dir)
     client = get_router()
-    resp = _guarded(
+    resp = guarded_call(
         client.get_document_thumb,
         f"GET /sources/{source_id}/docs/{doc_id}/thumb",
         _DOC_HINT,

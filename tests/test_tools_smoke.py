@@ -75,8 +75,14 @@ def call_tool(mcp_server: Any) -> Any:
 
 
 def test_core_family_smoke(call_tool: Any) -> None:
-    """core: list_sources + search atravessam MCP -> Router -> fake (WI-1/WI-20)."""
-    sources = call_tool("list_sources")
+    """core: list_sources + search atravessam MCP -> Router -> fake (WI-1/WI-20).
+
+    M-2/AC3: list_sources devolve dados + falha por endpoint offline
+    (offline_endpoints vazio quando o fake unico responde).
+    """
+    listing = call_tool("list_sources")
+    assert listing["offline_endpoints"] == []
+    sources = listing["sources"]
     assert [s["id"] for s in sources] == [SOURCE_ID, SOURCE_ID_2]
     assert sources[0]["path"] == SOURCE_PATH
 

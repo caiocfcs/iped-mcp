@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-import requests
 from fastmcp import FastMCP
 
-from iped_mcp.diagnose import diagnose_500
+from iped_mcp.diagnose import guarded_call
 from iped_mcp.fetch import cache_get, cache_set, fetch_docs_parallel
 from iped_mcp.router import get_router
 from iped_mcp.ufed.queries import (
@@ -62,16 +61,9 @@ def ufed_search(
         raise ValueError("limit deve estar entre 1 e 500.")
     query = build_ufed_query(attr, value=value, values=values, extra_filters=extra_filters)
     client = get_router()
-    try:
-        results = client.search(query, source_id=source_id)
-    except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 500:
-            raise ValueError(diagnose_500(query, _UFED_HINT)) from exc
-        raise
-    except requests.ConnectionError as exc:
-        raise ValueError(
-            "Servidor IPED indisponível. Verifique se o IPED está rodando."
-        ) from exc
+    # Politica unica de erro (M-2): guard compartilhado; 500 → diagnose com a
+    # query montada; rede/timeout/404 → textos estáveis de iped_mcp.errors.
+    results = guarded_call(client.search, query, _UFED_HINT, query, source_id=source_id)
     ids = [doc_id for group in results for doc_id in group.get("ids", [])]
     docs = []
     for doc_id, props in fetch_docs_parallel(source_id, ids[:limit]):

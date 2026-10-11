@@ -29,6 +29,17 @@ from urllib.parse import urlparse
 import requests
 
 from iped_mcp.client import IPEDClient
+from iped_mcp.errors import (
+    IpedConnectionError,
+    IpedError,
+    IpedTimeoutError,
+    ResourceNotFoundError,
+    ServerError,
+    no_endpoint_online_message,
+    source_not_found_message,
+    source_unavailable_message,
+    timeout_message,
+)
 
 logger = logging.getLogger("iped_mcp.router")
 
@@ -38,6 +49,17 @@ _PROBE_TIMEOUT = 5.0
 # chamado em add/create/save (1 GET /bookmarks cada); o cache corta a
 # repetição. Mutações via MCP invalidam; mudança externa fica ≤ TTL stale.
 _BOOKMARKS_TTL = 30.0
+# Métodos cujo path carrega doc_id: o erro deles fala de "doc", não de source.
+_DOC_METHODS = frozenset(
+    {
+        "get_document",
+        "get_document_content",
+        "get_document_text",
+        "get_document_thumb",
+    }
+)
+# Máximo de caracteres do motivo de falha de endpoint reportado na listagem (AC3).
+_FAILURE_REASON_LIMIT = 200
 
 
 class RouterStartupError(Exception):
@@ -109,6 +131,12 @@ def parse_endpoints(
     return {"default": DEFAULT_IPED_URL}
 
 
+def _failure_reason(exc: BaseException) -> str:
+    """Motivo legível (truncado) da falha de um endpoint para listagem."""
+    text = " ".join(str(exc).split()) or type(exc).__name__
+    return text[:_FAILURE_REASON_LIMIT]
+
+
 def _source_id(source: Any) -> str:
     """Extrai o id de um source (dict {id, path} ou string)."""
     if isinstance(source, dict):
@@ -157,27 +185,32 @@ class Router:
 
     def _list_all(
         self, timeout: float | None
-    ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    ) -> tuple[dict[str, list[dict[str, Any]]], list[str], dict[str, str]]:
         """`GET /sources/` em paralelo em todos os endpoints.
 
-        → (online {endpoint_id: [sources]}, offline [endpoint_id]).
+        → (online {endpoint_id: [sources]}, offline [endpoint_id],
+           {endpoint_id: motivo da falha}).
         """
 
-        def _one(eid: str) -> tuple[str, list[dict[str, Any]] | None]:
+        def _one(
+            eid: str,
+        ) -> tuple[str, list[dict[str, Any]] | None, str | None]:
             try:
-                return eid, self._clients[eid].list_sources(timeout=timeout)
-            except requests.RequestException:
-                return eid, None
+                return eid, self._clients[eid].list_sources(timeout=timeout), None
+            except (IpedError, requests.RequestException) as exc:
+                return eid, None, _failure_reason(exc)
 
         online: dict[str, list[dict[str, Any]]] = {}
         offline: list[str] = []
+        failures: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=max(1, len(self._clients))) as pool:
-            for eid, sources in pool.map(_one, list(self._clients)):
+            for eid, sources, reason in pool.map(_one, list(self._clients)):
                 if sources is None:
                     offline.append(eid)
+                    failures[eid] = reason or "falha desconhecida"
                 else:
                     online[eid] = sources
-        return online, offline
+        return online, offline, failures
 
     def _probe(self) -> None:
         """Sonda todos os endpoints no startup e monta o registry.
@@ -185,12 +218,13 @@ class Router:
         Colisão de source id entre endpoints online → `RouterStartupError`
         (MCP não sobe). Todos offline → aviso em destaque (MCP sobe).
         """
-        online, offline = self._list_all(timeout=self._probe_timeout)
+        online, offline, failures = self._list_all(timeout=self._probe_timeout)
         for eid in offline:
             logger.warning(
-                "Endpoint IPED '%s' não respondeu no startup (GET /sources/); "
-                "seus sources ficam indisponíveis até ele voltar.",
+                "Endpoint IPED '%s' não respondeu no startup (GET /sources/): "
+                "%s — seus sources ficam indisponíveis até ele voltar.",
                 eid,
+                failures.get(eid, "sem motivo"),
             )
         if not online:
             logger.warning(
@@ -231,7 +265,7 @@ class Router:
 
         Colisão nova em runtime → mantém o primeiro, avisa no log.
         """
-        self.list_sources()
+        self.list_sources_status()
 
     def online_count(self) -> int:
         """Nº de endpoints online na última sonda/listagem."""
@@ -251,42 +285,60 @@ class Router:
             with self._lock:
                 eid = self._registry.get(source_id)
         if eid is None:
-            raise ValueError(
-                f"Source '{source_id}' não encontrado em nenhum endpoint IPED. "
-                "Confira o nome com iped_list_sources."
-            )
+            if self.online_count() == 0:
+                # Servidor mudo ≠ source inexistente (AC2): a re-listagem não
+                # viu NENHUM source — é indisponibilidade, não ausência.
+                raise ValueError(no_endpoint_online_message(source_id))
+            raise ValueError(source_not_found_message(source_id))
         return self._clients[eid]
 
     def _call(self, sid: str, method_name: str, *args: Any, **kwargs: Any) -> Any:
-        """Rota o método para o endpoint de sid; erro de rede → ValueError
-        centrado em source (o agente nunca vê endpoint)."""
+        """Rota o método para o endpoint de sid; erro IPED → ValueError com
+        texto estável centrado em source (o agente nunca vê endpoint nem
+        exceção de transporte).
+
+        `ServerError` em `search` é re-lançado tipado: os consumidores de
+        busca (`fetch.search_ids`; tools via `guarded_call`) diagnosticam o
+        500 de query na hora, sem retry — comportamento anterior ao M-2.
+        """
         client = self.resolve(sid)
         try:
             return getattr(client, method_name)(*args, **kwargs)
-        except requests.ConnectionError as exc:
-            raise ValueError(
-                f"Source '{sid}' indisponível: o servidor correspondente "
-                "não responde."
-            ) from exc
-        except requests.Timeout as exc:
-            raise ValueError(
-                f"Timeout no source '{sid}': o servidor demorou demais "
-                "para responder. Tente novamente ou refine a query."
-            ) from exc
+        except IpedTimeoutError as exc:
+            raise ValueError(timeout_message(sid)) from exc
+        except IpedConnectionError as exc:
+            raise ValueError(source_unavailable_message(sid)) from exc
+        except ResourceNotFoundError as exc:
+            if method_name in _DOC_METHODS:
+                raise ValueError(str(exc)) from exc
+            raise ValueError(source_not_found_message(sid)) from exc
+        except ServerError as exc:
+            if method_name == "search":
+                raise
+            raise ValueError(str(exc)) from exc
+        except IpedError as exc:
+            raise ValueError(str(exc)) from exc
 
     # --- API roteada (mesma superfície do IPEDClient) ------------------------
 
-    def list_sources(self) -> list[dict[str, Any]]:
-        """Mescla os sources de todos os endpoints online (sem tag de endpoint).
+    def list_sources_status(self) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Mescla os sources dos endpoints online e reporta falha por endpoint.
 
-        Atualiza o registry (sources novos; colisão → mantém o primeiro,
-        avisa). Endpoints offline: seus sources simplesmente não aparecem.
+        A falha de um servidor é DEVOLVIDA como dado ({endpoint: motivo}),
+        nunca engolida (M-2/AC3): lista vazia com todos offline é
+        diagnóstico, não "caso sem fontes". Atualiza o registry (sources
+        novos; colisão → mantém o primeiro, avisa).
+
+        Returns:
+            (sources mesclados sem tag de endpoint,
+             {endpoint_id: motivo da falha} — vazio quando todos respondem).
         """
-        online, offline = self._list_all(timeout=None)
+        online, offline, failures = self._list_all(timeout=None)
         for eid in offline:
             logger.warning(
-                "Endpoint IPED '%s' não respondeu; seus sources não estão na lista.",
+                "Endpoint IPED '%s' não respondeu (%s); seus sources não estão na lista.",
                 eid,
+                failures.get(eid, "sem motivo"),
             )
         with self._lock:
             self._online = set(online)
@@ -307,6 +359,15 @@ class Router:
                     registry[sid] = eid
                     merged.append(source)
             self._registry = registry
+        return merged, failures
+
+    def list_sources(self) -> list[dict[str, Any]]:
+        """Sources mesclados de todos os endpoints online (sem tag de endpoint).
+
+        Endpoints offline: seus sources não aparecem; o motivo de cada falha
+        fica em `list_sources_status` (dado, não aviso silencioso).
+        """
+        merged, _ = self.list_sources_status()
         return merged
 
     def search(
