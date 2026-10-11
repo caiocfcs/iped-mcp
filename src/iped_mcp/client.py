@@ -68,6 +68,53 @@ _TEXT_CHUNK_SIZE = 65536
 TEXT_STATUS_OK = "ok"
 TEXT_STATUS_NO_TEXT = "no_text"
 
+# M-13: percent-encoding de QUALQUER id embutido em path (fonte unica).
+# '@' fica cru porque e o caractere dos ids reais de source (e-mails,
+# 2d 00-sources.json): o quote() default o escaparia para %40 e mudaria
+# byte-a-byte a URL de todo uso atual. '/' NAO entra em safe: um '/'
+# dentro de um id jamais podera virar dois segmentos de path.
+_ID_PATH_SAFE_CHARS = "@"
+
+
+def _quote_path_id(value: object) -> str:
+    """Codifica um id cru para segmento de path da WebAPI (M-13, fonte unica).
+
+    Toda montagem de path do cliente passa por esta funcao: uma unica
+    aplicacao de ``urllib.parse.quote`` por id. Nao existe dupla escapagem
+    interna porque (1) os ids nascem crus no JSON da WebAPI (``/sources``,
+    ``/search``) e (2) o requests nao re-codifica sequencias ``%XX`` ja
+    presentes no path (``requote_uri`` trata ``%`` como seguro), entao a
+    URL final contem exatamente a codificacao produzida aqui.
+
+    Args:
+        value: identificador cru (``source_id``, ``doc_id`` ou nome de
+            bookmark; inteiros sao aceitos para ``doc_id``).
+
+    Returns:
+        Id apto a interpolar no path: o alfabeto observado na 2d (letras,
+        digitos, ``.``, ``-``, ``_``, ``@``) sai byte-a-byte identico;
+        espaco vira ``%20``, ``%`` literal vira ``%25`` e acentos viram
+        sequencias UTF-8 (``cafe`` acentuado -> ``%C3%A9``).
+    """
+    return quote(str(value), safe=_ID_PATH_SAFE_CHARS)
+
+
+def _doc_path(source_id: object, doc_id: object, subview: str = "") -> str:
+    """Monta `sources/{sid}/docs/{did}[/{subview}]` com os ids codificados.
+
+    Args:
+        source_id: source do doc (cru).
+        doc_id: id do doc (cru; inteiro aceito).
+        subview: sub-visao final (``content``, ``text``, ``thumb``) ou ""
+            para o doc completo (endpoint #3).
+
+    Returns:
+        Caminho relativo pronto para ``_request`` — a codificacao acontece
+        so aqui; o destino NUNCA deve re-quotear.
+    """
+    base = f"sources/{_quote_path_id(source_id)}/docs/{_quote_path_id(doc_id)}"
+    return f"{base}/{subview}" if subview else base
+
 
 class TextResult(NamedTuple):
     """Resultado de uma leitura de /text — status como dado (DESIGN 08 / M-8).
@@ -485,7 +532,7 @@ class IPEDClient:
                 "Doc não encontrado".
         """
         return self._get(
-            f"sources/{source_id}/docs/{doc_id}",
+            _doc_path(source_id, doc_id),
             timeout=self._props_timeout,
             source_id=source_id,
             doc_id=doc_id,
@@ -493,7 +540,8 @@ class IPEDClient:
 
     # --- Bookmarks (marcadores) ---
     # Tudo dá HTTP 200; mutações (POST/PUT/DELETE) retornam body vazio —
-    # checar status_code, nunca resp.json(). Nomes com espaço exigem quote().
+    # checar status_code, nunca resp.json(). Nomes passam por _quote_path_id
+# (M-13, fonte unica — mesma codificacao das rotas de doc).
     # Resiliência (M-3): mutações só re-tentam falha de CONEXÃO (pré-resposta);
     # timeout/5xx em mutação = resposta ambígua → sobe na hora.
 
@@ -520,7 +568,7 @@ class IPEDClient:
         Raises:
             IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
         """
-        return self._get(f"bookmarks/{quote(bookmark)}")["data"]
+        return self._get(f"bookmarks/{_quote_path_id(bookmark)}")["data"]
 
     def create_bookmark(self, name: str) -> None:
         """Cria um bookmark vazio (POST, body vazio). Não erroa se já existe.
@@ -531,7 +579,7 @@ class IPEDClient:
         Raises:
             IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
         """
-        self._request("POST", f"bookmarks/{quote(name)}")
+        self._request("POST", f"bookmarks/{_quote_path_id(name)}")
 
     def add_to_bookmark(self, bookmark: str, docs: list[dict[str, Any]]) -> None:
         """Adiciona docs ao bookmark. docs: [{"source": str, "id": int}].
@@ -545,7 +593,7 @@ class IPEDClient:
         Raises:
             IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
         """
-        self._request("PUT", f"bookmarks/{quote(bookmark)}/add", json=docs)
+        self._request("PUT", f"bookmarks/{_quote_path_id(bookmark)}/add", json=docs)
 
     def remove_from_bookmark(self, bookmark: str, docs: list[dict[str, Any]]) -> None:
         """Remove docs do bookmark. docs: [{"source": str, "id": int}].
@@ -557,7 +605,9 @@ class IPEDClient:
         Raises:
             IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
         """
-        self._request("PUT", f"bookmarks/{quote(bookmark)}/remove", json=docs)
+        self._request(
+            "PUT", f"bookmarks/{_quote_path_id(bookmark)}/remove", json=docs
+        )
 
     def rename_bookmark(self, old_name: str, new_name: str) -> None:
         """Renomeia um bookmark.
@@ -570,7 +620,9 @@ class IPEDClient:
             IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
         """
         self._request(
-            "PUT", f"bookmarks/{quote(old_name)}/rename/{quote(new_name)}"
+            "PUT",
+            f"bookmarks/{_quote_path_id(old_name)}"
+            f"/rename/{_quote_path_id(new_name)}",
         )
 
     def delete_bookmark(self, name: str) -> None:
@@ -582,7 +634,7 @@ class IPEDClient:
         Raises:
             IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
         """
-        self._request("DELETE", f"bookmarks/{quote(name)}")
+        self._request("DELETE", f"bookmarks/{_quote_path_id(name)}")
 
     def get_document_content(
         self, source_id: str, doc_id: int
@@ -604,7 +656,7 @@ class IPEDClient:
         """
         resp = self._request(
             "GET",
-            f"sources/{source_id}/docs/{doc_id}/content",
+            _doc_path(source_id, doc_id, "content"),
             timeout=self._download_timeout,
             source_id=source_id,
             doc_id=doc_id,
@@ -651,7 +703,7 @@ class IPEDClient:
         try:
             resp = self._request(
                 "GET",
-                f"sources/{source_id}/docs/{doc_id}/text",
+                _doc_path(source_id, doc_id, "text"),
                 timeout=self._text_timeout,
                 source_id=source_id,
                 doc_id=doc_id,
@@ -711,7 +763,7 @@ class IPEDClient:
         """
         return self._request(
             "GET",
-            f"sources/{source_id}/docs/{doc_id}/thumb",
+            _doc_path(source_id, doc_id, "thumb"),
             timeout=self._download_timeout,
             source_id=source_id,
             doc_id=doc_id,
