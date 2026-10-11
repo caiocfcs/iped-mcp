@@ -126,6 +126,11 @@ class FakeWebAPI:
         search_peak_inflight: pico observado de /search simultâneos.
         content_types: {doc_id: Content-Type} do GET /content (M-10: fixture
             P1-3 — extensão do export deve seguir o type real do jar).
+        has_pagination: True = jar FORK com P1-1 (limit/offset respeitados;
+            "total" só com paginação explícita); False = jar atual ignora.
+        has_case_summary: True = GET /case-summary 200 (F-5 do fork).
+        has_properties_fields: "absent"|"noeffect"|"filtered" — estado do
+            F-1 no jar sondado (404 / 200 com props completas / 200 filtrado).
     """
 
     base_url: str = ""
@@ -141,6 +146,9 @@ class FakeWebAPI:
     search_inflight: int = 0
     search_peak_inflight: int = 0
     content_types: dict[int, str] = field(default_factory=dict)
+    has_pagination: bool = False
+    has_case_summary: bool = False
+    has_properties_fields: str = "absent"
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def source_ids(self) -> set[str]:
@@ -335,6 +343,8 @@ class FakeAPIHandler(BaseHTTPRequestHandler):
             return self._route_bookmarks(method, parts)
         if method == "GET" and parts[:1] == ["categories"]:
             return self._route_categories()
+        if method == "GET" and parts[:1] == ["case-summary"]:
+            return self._route_case_summary()
         self._send(404, "text/plain", b"not found")
 
     def _read_body(self) -> bytes:
@@ -370,6 +380,8 @@ class FakeAPIHandler(BaseHTTPRequestHandler):
             return self._send_chunked("text/plain", TEXT_BODY)
         if view == "thumb":
             return self._send_thumb(doc_id)
+        if view == "properties":
+            return self._route_properties_fields(doc)
         self._send(404, "text/plain", b"not found")
 
     def _send_content(self, doc_id: int) -> None:
@@ -395,6 +407,31 @@ class FakeAPIHandler(BaseHTTPRequestHandler):
         if not self.api.has_categories_endpoint:
             return self._send(404, "text/plain", b"not found")
         self._json({"data": list(self.api.categories)})
+
+    def _route_case_summary(self) -> None:
+        """GET /case-summary: 200 com data no jar FORK; 404 no jar atual (2d 19)."""
+        if not self.api.has_case_summary:
+            return self._send(404, "text/plain", b"not found")
+        self._json({"data": {"totalItems": 0, "categories": []}})
+
+    def _route_properties_fields(self, doc: dict[str, Any]) -> None:
+        """GET /docs/{id}/properties?fields=: os 3 estados do F-1 no jar.
+
+        has_properties_fields: "absent" = jar atual (404); "noeffect" = jar
+        que responde 200 com as props COMPLETAS e ignora fields= (armadilha
+        P2-8 que a deteccao precisa rejeitar); "filtered" = fork F-1 (200
+        somente com os campos pedidos na query).
+        """
+        mode = self.api.has_properties_fields
+        if mode == "absent":
+            return self._send(404, "text/plain", b"not found")
+        props = dict(doc.get("properties", {}))
+        if mode == "noeffect":
+            return self._json({"properties": props})
+        requested = [
+            f for f in (self._entry["query"].get("fields", [""])[0]).split(",") if f
+        ]
+        self._json({"properties": {f: props.get(f, [""]) for f in requested}})
 
     def _route_search(self) -> None:
         """GET /search (#2): source desconhecido -> 404; senao grupos sem total.
@@ -422,7 +459,18 @@ class FakeAPIHandler(BaseHTTPRequestHandler):
                     api.search_inflight -= 1
         ids = api.search_ids(q)
         data = [{"source": sid or SOURCE_ID, "ids": ids}] if ids else []
-        self._json({"data": data})
+        payload = {"data": data}
+        # Jar FORK (P1-1): com has_pagination, limit/offset sao respeitados e
+        # "total" so aparece quando a paginacao e explicita; sem o flag o
+        # jar atual ignora os parametros (P2-8) e o corpo sem o campo e
+        # identico ao do baseline (pin M-1 byte-a-byte preservado).
+        if api.has_pagination and ("limit" in query or "offset" in query):
+            offset = _as_int(query.get("offset", ["0"])[0])
+            limit = _as_int(query.get("limit", [str(len(ids))])[0])
+            for group in data:
+                group["ids"] = group["ids"][offset:offset + limit]
+            payload["total"] = len(ids)
+        self._json(payload)
 
     def _route_bookmarks(self, method: str, parts: list[str]) -> None:
         """Rota dos endpoints #4-#10 (bookmarks)."""
@@ -502,6 +550,10 @@ def fake_router(webapi: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(fetch, "_text_cache", {})
     monkeypatch.setattr(census_mod, "_result_cache", {})
     router = router_mod.Router({"default": webapi.base_url})
+    # O startup do Router agora sonda capacidades (M-11): os pedidos de
+    # sonda nao sao trafego das tools e saem do log para nao poluir os
+    # pinos de URL/contagem dos testes existentes.
+    webapi.requests_log.clear()
     monkeypatch.setattr(router_mod, "_router", router)
     return router
 

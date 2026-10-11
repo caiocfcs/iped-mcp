@@ -421,6 +421,11 @@ class TestFetchDelegaResiliencia:
         self, webapi: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # 1º item: sonda/registry do Router na construção; 2º: o /search 500.
+        # M-11: sondas de capacidade não interessam aqui (a sessão é scriptada
+        # só para /sources) e são desligadas antes da construção do Router.
+        monkeypatch.setattr(
+            router_mod.Router, "_probe_capabilities", lambda self, online: None
+        )
         session = FakeSession(
             [make_response(200, webapi.sources), make_response(500)]
         )

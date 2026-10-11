@@ -130,8 +130,16 @@ def list_sources() -> dict[str, Any]:
 
     Returns:
         {"sources": [{id, path}, ...],
+         "jar_capabilities": {"fork_features_enabled": bool,
+                              "endpoints": [{endpoint, url,
+                                             search_pagination, case_summary,
+                                             properties_fields}, ...]},
          "offline_endpoints": [{"endpoint": id, "error": motivo}, ...]} —
          `offline_endpoints` vazio quando todos os servidores responderam.
+         `jar_capabilities` (M-11) reporta as capacidades detectadas no jar
+         de cada endpoint online no startup e o estado do env
+         IPED_MCP_FORK_FEATURES — dado para o agente escolher recursos com
+         segurança; nunca uma exceção.
 
     Raises:
         ValueError: falha inesperada de comunicação (taxonomia M-2).
@@ -140,9 +148,11 @@ def list_sources() -> dict[str, Any]:
     now = time.monotonic()
     if _sources_cache is not None and now - _sources_cache[0] < _SOURCES_TTL:
         return _sources_cache[1]
-    sources, failures = get_router().list_sources_status()
+    router = get_router()
+    sources, failures = router.list_sources_status()
     result: dict[str, Any] = {
         "sources": sources,
+        "jar_capabilities": router.capabilities_payload(),
         "offline_endpoints": [
             {"endpoint": eid, "error": reason}
             for eid, reason in sorted(failures.items())

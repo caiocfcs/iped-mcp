@@ -140,6 +140,19 @@ DEFAULT_EXPORTS_DIR = "/tmp/iped_mcp/exports"
 EXPORTS_DIR = os.environ.get("IPED_MCP_EXPORTS_DIR", DEFAULT_EXPORTS_DIR)
 
 
+# --- Superfície do fork (DESIGN 11 / M-11) ---------------------------------
+# Parâmetros do fork (limit/offset explícitos, fields=, filtros F-2) NUNCA
+# são enviados por default: o jar em execução ignora parâmetros
+# desconhecidos em silêncio (P2-8) e um limit default futuro truncaria os
+# consumidores sem aviso (R9/NR-3). A superfície só liga com esta env
+# explícita E detecção positiva de capacidade no startup (router.py).
+# "1" liga; qualquer outro valor (inclusive ausente) mantém desligado.
+DEFAULT_FORK_FEATURES = "0"
+FORK_FEATURES_ENABLED = (
+    os.environ.get("IPED_MCP_FORK_FEATURES", DEFAULT_FORK_FEATURES).strip() == "1"
+)
+
+
 # --- Bind do servidor MCP (M-12) ----------------------------------------------
 # O bind era hard-coded em main.py (127.0.0.1:8000; D-31): dentro de container
 # (deploy do ICARO) o loopback e inalcançavel do host sem patch. Vira config
