@@ -11,6 +11,7 @@ from iped_mcp.fetch import cache_set as _cache_set
 from iped_mcp.fetch import fetch_docs_parallel, search_ids as _search_ids
 from iped_mcp.progress import BatchWindow, resolve_batch
 from iped_mcp.regex.queries import KNOWN_TYPES, build_regex_query
+from iped_mcp.sampling import stratified_sample
 
 _REGEX_HINT = "Use regex_list_types para conferir os tipos válidos."
 
@@ -128,14 +129,6 @@ def scan_attribute(
     return result
 
 
-def _stratified_sample(ids: list[int], n: int) -> list[int]:
-    """Escolhe n ids espaçados ao longo da lista (não só os primeiros)."""
-    if len(ids) <= n:
-        return list(ids)
-    step = len(ids) / n
-    return [ids[int(i * step)] for i in range(n)]
-
-
 def discover_types(source_id: str, sample_size: int) -> dict[str, Any]:
     """Descobre os tipos `Regex:*` presentes no source.
 
@@ -163,7 +156,7 @@ def discover_types(source_id: str, sample_size: int) -> dict[str, Any]:
             if count:
                 types[name] = {"docs": count, "how": "exact"}
         all_ids = all_future.result()
-    sampled_ids = _stratified_sample(all_ids, sample_size)
+    sampled_ids = stratified_sample(all_ids, sample_size)
     for _doc_id, props in fetch_docs_parallel(source_id, sampled_ids):
         if not props:
             continue

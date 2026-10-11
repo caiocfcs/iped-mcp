@@ -411,13 +411,23 @@ def bookmarks_report(
     return {"total": total, "failed": failed, "docs": docs}
 
 
-def bookmarks_download(bookmark: str, dest_dir: str, source_id: str) -> dict[str, Any]:
-    """Baixa todos os arquivos de um bookmark para uma pasta local.
+def bookmarks_download(
+    bookmark: str,
+    dest_dir: str,
+    source_id: str,
+    offset: int = 0,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Baixa os arquivos de um bookmark para uma pasta local (lotes opcionais).
 
-    Sem teto de docs — o objetivo é salvar todos; bookmark grande pode levar
-    minutos. Doc sem arquivo → skipped; falha em 1 doc não aborta o lote
-    (reportada em failed/first_failures). O path é resolvido na máquina onde
-    o MCP roda.
+    Sem teto de docs por lote — o objetivo é salvar todos; bookmark grande
+    pode levar minutos, então `offset`/`limit` fatiam a lista plana de docs
+    do bookmark (padrão M-9): com lote, o envelope traz `batch` e
+    `phase="partial"` enquanto restam docs, e reinvocar com
+    offset = offset + limit continua de onde parou. O default (offset=0,
+    limit omitido) baixa tudo como antes. Doc sem arquivo → skipped; falha
+    em 1 doc não aborta o lote (reportada em failed/first_failures). O path
+    é resolvido na máquina onde o MCP roda.
 
     Args:
         bookmark: nome do bookmark.
@@ -425,6 +435,18 @@ def bookmarks_download(bookmark: str, dest_dir: str, source_id: str) -> dict[str
             não existir).
         source_id: source no IPED (veja iped_list_sources); define em qual
             servidor agir.
+        offset: docs a pular antes do lote (padrão 0 = bookmark inteiro).
+        limit: docs no lote (omitido = até o fim). Enquanto `batch.has_more`
+            for True, continue com offset = offset + limit.
+
+    Returns:
+        Envelope do lote: {saved, skipped, failed, total_bytes, dest_dir,
+        first_failures} + contadores {phase, scanned, processed, elapsed_s,
+        remaining_est, batch} (+ `warning` quando dest_dir é relativo).
+
+    Raises:
+        ValueError: bookmark/dest_dir vazios, diretório não criável ou
+            offset/limit fora do contrato (offset >= 0, limit >= 1).
     """
     bookmark = bookmark.strip()
     if not bookmark:
@@ -439,7 +461,9 @@ def bookmarks_download(bookmark: str, dest_dir: str, source_id: str) -> dict[str
         raise ValueError(
             f"Não foi possível criar o diretório de destino '{target}': {e}"
         ) from e
-    result = download_bookmark(bookmark, target, source_id)
+    result = download_bookmark(
+        bookmark, target, source_id, offset=offset, limit=limit
+    )
     if not is_abs:
         result["warning"] = (
             f"dest_dir '{dest_dir}' é relativo e resolve contra o cwd do "

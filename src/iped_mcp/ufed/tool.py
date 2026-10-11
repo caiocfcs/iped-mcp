@@ -10,6 +10,7 @@ from iped_mcp import validation
 from iped_mcp.diagnose import guarded_call
 from iped_mcp.fetch import cache_get, cache_set, fetch_docs_parallel, search_ids
 from iped_mcp.router import get_router
+from iped_mcp.sampling import stratified_sample
 from iped_mcp.ufed.queries import (
     KNOWN_FIELDS,
     build_ufed_query,
@@ -150,26 +151,6 @@ def ufed_device_info(source_id: str) -> dict[str, Any]:
     return out
 
 
-def _stratified_sample(ids: list[int], n: int) -> list[int]:
-    """Escolhe n ids espaçados ao longo da lista (não só os primeiros).
-
-    Cópias locais de regex/scan.py:79-84 até haver helper compartilhado:
-    começar a lista sem amostragem estratificada pode ver só um tipo de
-    arquivo e esconder campos presentes no resto do caso.
-
-    Args:
-        ids: Ids de todos os hits.
-        n: Tamanho desejado da amostra.
-
-    Returns:
-        Até n ids espaçados uniformemente (todos, se len(ids) <= n).
-    """
-    if len(ids) <= n:
-        return list(ids)
-    step = len(ids) / n
-    return [ids[int(i * step)] for i in range(n)]
-
-
 def _observed_fields_sample(source_id: str, sample_size: int) -> tuple[list[str], int]:
     """Descobre por evidência os campos `ufed:` presentes em um source.
 
@@ -193,7 +174,7 @@ def _observed_fields_sample(source_id: str, sample_size: int) -> tuple[list[str]
     if cached is not None:
         return cached
     all_ids = search_ids(_MATCH_ALL_QUERY, source_id, _UFED_HINT, timeout=_MATCH_ALL_TIMEOUT)
-    sampled_ids = _stratified_sample(all_ids, sample_size)
+    sampled_ids = stratified_sample(all_ids, sample_size)
     observed: set[str] = set()
     for _doc_id, props in fetch_docs_parallel(source_id, sampled_ids):
         if props:

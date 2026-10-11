@@ -18,6 +18,7 @@ from iped_mcp.regex.tool import regex_export_csv, regex_stats, regex_top_values
 from iped_mcp.whatsapp.collect import MessageRecord
 from iped_mcp.whatsapp import tool as wa_tool
 from iped_mcp.bookmarks.download import download_bookmark
+from iped_mcp.bookmarks import tool as bm_tool
 from tests.conftest import (
     DOC_NO_DISPOSITION_ID,
     DOC_NO_IMAGE_ID,
@@ -182,6 +183,49 @@ def test_download_bookmark_offset_fora_do_dominio(
     result = download_bookmark("dl3", str(tmp_path), SOURCE_ID, offset=10, limit=3)
     assert result["scanned"] == 0 and result["saved"] == 0
     assert result["phase"] == "complete" and result["batch"]["has_more"] is False
+
+
+def test_tool_bookmarks_download_expoe_lote_sem_sobreposicao(
+    webapi: Any, fake_router: Any, tmp_path: Any
+) -> None:
+    """Follow-up M-9: a tool expõe offset/limit — 2 lotes cobrem o domínio."""
+    _add_download_docs(webapi, [911, 912, 913])
+    ids = [DOC_NO_IMAGE_ID, DOC_TEXT_ID, DOC_NO_DISPOSITION_ID, 911, 912, 913]
+    webapi.bookmarks["dl6t"] = [{"source": SOURCE_ID, "ids": ids}]
+    first = bm_tool.bookmarks_download("dl6t", str(tmp_path), SOURCE_ID, limit=4)
+    second = bm_tool.bookmarks_download(
+        "dl6t", str(tmp_path), SOURCE_ID, offset=4, limit=4
+    )
+    assert first["phase"] == "partial"
+    assert first["batch"] == {"offset": 0, "limit": 4, "total": 6, "has_more": True}
+    assert second["phase"] == "complete" and second["batch"]["has_more"] is False
+    assert first["scanned"] == 4 and second["scanned"] == 2
+    assert first["saved"] + second["saved"] == 6
+    assert len(list(tmp_path.iterdir())) == 6  # sem sobreposição: 6 arquivos
+
+
+def test_tool_bookmarks_download_default_continua_1_shot(
+    webapi: Any, fake_router: Any, tmp_path: Any
+) -> None:
+    """Regressão do default: sem offset/limit a tool baixa tudo numa chamada."""
+    webapi.bookmarks["dl3t"] = [
+        {"source": SOURCE_ID, "ids": [DOC_NO_IMAGE_ID, DOC_TEXT_ID, DOC_NO_DISPOSITION_ID]}
+    ]
+    result = bm_tool.bookmarks_download("dl3t", str(tmp_path), SOURCE_ID)
+    assert result["phase"] == "complete"
+    assert result["batch"] == {"offset": 0, "limit": None, "total": 3, "has_more": False}
+    assert result["saved"] == 3
+
+
+def test_tool_bookmarks_download_valida_parametros_de_lote(
+    webapi: Any, fake_router: Any, tmp_path: Any
+) -> None:
+    """Contrato resolve_batch propagado pela tool: offset >= 0, limit >= 1."""
+    webapi.bookmarks["dl3t"] = [{"source": SOURCE_ID, "ids": [DOC_NO_IMAGE_ID]}]
+    with pytest.raises(ValueError):
+        bm_tool.bookmarks_download("dl3t", str(tmp_path), SOURCE_ID, offset=-1)
+    with pytest.raises(ValueError):
+        bm_tool.bookmarks_download("dl3t", str(tmp_path), SOURCE_ID, limit=0)
 
 
 # ---------------------------------------------------------------- whatsapp
