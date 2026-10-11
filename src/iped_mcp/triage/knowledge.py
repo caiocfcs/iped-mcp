@@ -119,3 +119,63 @@ SAMPLE_DOC_IDS_MAX = 3
 TELEPHONY_EMPTY_MESSAGE = (
     "nenhum documento das categorias de telefonia neste source"
 )
+
+# --- T-2 transcripts: queries e campos ----------------------------------------
+
+# Queries candidatas de áudio, na ordem: a primeira que produzir registros
+# encerra a varredura (fallback só quando a anterior não produziu nada).
+# Origem: iped-icaro/transcripts/transcript_generator_service.py:37-41
+# (categoria [Audios] validada no caso real do ICARO; service:35-36).
+AUDIO_QUERIES = (
+    'category:"Audios"',
+    'category:"Áudios"',
+    "ext:opus OR ext:amr OR ext:m4a OR ext:mp3 OR ext:wav",
+)
+
+# Metadado ASR embutido no índice. Origem: service:146.
+TRANSCRIPT_FIELD = "audio:transcription"
+# Chave do dedup (minúsculo; fallback nome). Origem: service:150-154.
+AUDIO_HASH_FIELDS = ("hash", "md5")
+# Campos de data de criação, na ordem de fallback. Origem: service:202.
+AUDIO_CREATED_FIELDS = ("criacao", "criação", "created")
+# Data/hora explícita "dd/mm/aaaa HH:MM:SS". Origem: service:205-208.
+CREATED_DTL_RE = r"(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})"
+CREATED_DT_FORMAT = "%d/%m/%Y %H:%M:%S"
+# Dígitos puros com este tamanho ou mais = epoch em milissegundos.
+# Origem: service:213.
+EPOCH_MS_MIN_LEN = 13
+# Posições da tupla de ordenação: docs COM data vêm antes dos sem data.
+# Origem: service:200-215 (sort :99).
+WITH_DATE_SORT_RANK = 0
+NO_DATE_SORT_RANK = 1
+# Guarda de varredura = PAGE_SIZE × MAX_PAGES (500 × 200).
+# Origem: service:32-33.
+AUDIO_SCAN_MAX_DOCS = 100_000
+# Nome do artefato (análogo a "Transcrições.txt", service:31 — sem cedilha
+# para não depender do mapa do safe_name do M-10).
+TRANSCRIPT_FILE_BASENAME = "Transcricoes.txt"
+# Formato literal do bloco por áudio e o join entre blocos.
+# Origem: service:217-228.
+BLOCK_TEMPLATE = "Nome: {name}\nCaminho: {path}\nHASH: {hash}\n\n{text}\n"
+BLOCK_JOIN = "\n"
+# Caminho do índice usa ">>" como separador; o artefato usa "/".
+# Origem: service:157.
+PATH_TOKEN = ">>"
+PATH_SEPARATOR = "/"
+# Texto colapsado em 1 linha (evita colidir com o parser de blocos).
+# Origem: service:195-198.
+WS_COLLAPSE_RE = r"\s+"
+# --- T-2 transcripts: contrato de contexto ------------------------------------
+
+# Teto de texto na resposta MCP (DESIGN 09 §3.2): o texto completo NUNCA
+# viaja na resposta — só o preview; o arquivo é o artefato (M-10).
+PREVIEW_CHARS = 2000
+# Sufixo que marca o corte do preview (truncamento SEMPRE marcado, §3.4).
+PREVIEW_ELLIPSIS = "…"
+# Caso sem áudio/sem transcrição: zero explícito, não erro. Texto-espelho
+# do service:92-97.
+TRANSCRIPTS_EMPTY_MESSAGE = (
+    "Nenhum áudio com transcrição embutida encontrado no IPED "
+    "(metadado 'audio:transcription'). Verifique se a extração "
+    "possui transcrição automática de áudio."
+)

@@ -21,6 +21,7 @@ from iped_mcp import fetch
 from iped_mcp.progress import op_envelope
 from iped_mcp.router import get_router
 from iped_mcp.triage import knowledge
+from iped_mcp.triage.fields import first_str
 
 _KIND_CALL = "call"
 _KIND_CONTACT = "contact"
@@ -66,24 +67,6 @@ class _Scan:
     contact_docs: int = 0
     categories_seen: set[str] = field(default_factory=set)
     warnings: list[str] = field(default_factory=list)
-
-
-def _first_str(props: dict[str, Any], keys: tuple[str, ...]) -> str:
-    """Primeiro elemento (como string) da primeira propriedade não vazia.
-
-    Args:
-        props: propriedades do doc no envelope do jar (valores em lista).
-        keys: chaves na ordem de fallback (mesma semântica ``a or b`` do
-            ICARO, telephony_strategy.py:59/:77-78/:118).
-
-    Returns:
-        ``str`` do primeiro valor não vazio; ``""`` quando nada casa.
-    """
-    for key in keys:
-        values = props.get(key) or []
-        if values and str(values[0]).strip():
-            return str(values[0])
-    return ""
 
 
 def _parse_headto(comm_to: str) -> tuple[str, str] | None:
@@ -137,13 +120,13 @@ def _call_identity(props: dict[str, Any]) -> tuple[str, str]:
     Returns:
         Telefone e nome extraídos; ``("", "")`` quando não há número.
     """
-    comm_to = _first_str(props, knowledge.CALL_TO_FIELDS)
+    comm_to = first_str(props, knowledge.CALL_TO_FIELDS)
     if comm_to:
         parsed = _parse_headto(comm_to)
         if parsed is None:
             return "", ""
         return parsed[1], parsed[0]
-    raw = _first_str(props, knowledge.PHONE_FALLBACK_FIELDS)
+    raw = first_str(props, knowledge.PHONE_FALLBACK_FIELDS)
     return raw.strip().strip(knowledge.QUOTE_STRIP_CHARS), ""
 
 
@@ -168,13 +151,13 @@ def _apply_call(
     record.total_calls += 1
     if len(record.sample_doc_ids) < knowledge.SAMPLE_DOC_IDS_MAX:
         record.sample_doc_ids.append(doc_id)
-    direction = _first_str(props, (knowledge.DIRECTION_FIELD,)).lower()
+    direction = first_str(props, (knowledge.DIRECTION_FIELD,)).lower()
     for marker, attr in knowledge.DIRECTION_BUCKETS.items():
         if marker in direction:
             setattr(record, attr, getattr(record, attr) + 1)
             break
     record.total_duration_seconds += _parse_duration(
-        _first_str(props, (knowledge.DURATION_FIELD,))
+        first_str(props, (knowledge.DURATION_FIELD,))
     )
     return True
 
@@ -193,8 +176,8 @@ def _apply_contact(
     Returns:
         True quando o doc produziu registro (nome + número válidos).
     """
-    name = _first_str(props, knowledge.CONTACT_NAME_FIELDS).strip()
-    clean = re.sub(r"\D", "", _first_str(props, knowledge.CONTACT_PHONE_FIELDS))
+    name = first_str(props, knowledge.CONTACT_NAME_FIELDS).strip()
+    clean = re.sub(r"\D", "", first_str(props, knowledge.CONTACT_PHONE_FIELDS))
     if not name or not clean or len(clean) < knowledge.MIN_CONTACT_PHONE_DIGITS:
         return False
     if clean in contacts:
@@ -216,7 +199,7 @@ def _classify(props: dict[str, Any]) -> str | None:
     Returns:
         ``"call"``, ``"contact"`` ou ``None`` (categoria fora do eixo).
     """
-    category = _first_str(props, (knowledge.CATEGORY_FIELD,)).lower()
+    category = first_str(props, (knowledge.CATEGORY_FIELD,)).lower()
     if not any(cat in category for cat in knowledge.TELEPHONY_CATEGORIES):
         return None
     if any(marker in category for marker in knowledge.CALL_BRANCH_MARKERS):
@@ -277,7 +260,7 @@ def _aggregate(pairs: list[tuple[int, dict | None]], scan: _Scan) -> dict[str, _
         if kind is None:
             continue
         scan.categories_seen.add(
-            _first_str(props, (knowledge.CATEGORY_FIELD,)).lower()
+            first_str(props, (knowledge.CATEGORY_FIELD,)).lower()
         )
         if kind == _KIND_CALL:
             if _apply_call(contacts, doc_id, props):

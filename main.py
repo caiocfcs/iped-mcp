@@ -46,7 +46,7 @@ mcp = FastMCP(
         "whatsapp_reference documenta os campos e queries canônicas validados. "
         "A família triage_ traz triagem pronta sem LLM: triage_telephony agrega "
         "chamadas/contatos por número e devolve o top contatos com score e "
-        "relevância (tetos e truncamento sempre marcados na resposta)."
+        "relevância (tetos e truncamento sempre marcados na resposta); transcripts_generate grava o arquivo de transcrições de áudio (metadado audio:transcription) no disco de exports e devolve metadados + preview \" o texto completo nunca vai na resposta\""
     ),
 )
 

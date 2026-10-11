@@ -161,6 +161,11 @@ class FakeWebAPI:
         Args:
             query: Valor cru do parametro ``q`` (com escapes ``\\:`` do client).
 
+        Cobre as formas usadas pelos testes: ``category:"<cat>"`` (via
+        ``category_hits``), ``md5:``/``ufed:MD5``, ``Regex:<N>`` (propriedade
+        presente), ``ext:<x>`` com OR (propriedade ``ext`` igual, minúsculo
+        — fallbacks de áudio do T-2, DESIGN 09 §5 F2) e ``*`` match-all.
+
         Returns:
             Ids casados no SOURCE_ID; lista vazia quando nada casa (campo
             inexistente = 0 hits mudo, WI-16).
@@ -176,6 +181,18 @@ class FakeWebAPI:
             return [DOC_NO_IMAGE_ID]
         if q.startswith("Regex:"):
             return self._regex_hits(q.split(":", 2)[1])
+        if q.startswith("ext:"):
+            # Matcher trivial p/ queries "ext:<x> [OR ext:<y> ...]" (T-2,
+            # DESIGN 09 §5 F2): casa a propriedade ``ext`` do doc (minuscula)
+            # contra qualquer extensao listada na query.
+            exts = set(re.findall(r"ext:([a-z0-9]+)", q.lower()))
+            return [
+                i
+                for (src_, i), d in self.docs.items()
+                if src_ == SOURCE_ID
+                and str((d.get("properties", {}).get("ext") or [""])[0]).lower()
+                in exts
+            ]
         if q == "*":
             # Match-all reflete o catalogo atual de docs do SOURCE_ID (M-7:
             # testes adicionam docs p/ amostragem; com o catalogo padrao o
