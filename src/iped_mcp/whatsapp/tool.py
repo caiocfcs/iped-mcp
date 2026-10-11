@@ -65,6 +65,13 @@ TEXT_STATUS_UNAVAILABLE = "unavailable"
 # M-8, AC4): texto capped nunca entra no JSON como se fosse completo.
 TEXT_CAPPED_MARKER = "[TRUNCADO em {total_bytes} bytes — capped]"
 
+# Telemetria M-19: fração de referências de mídia das mensagens
+# (linkedItems "sha-256:...") que NÃO resolvem como doc de mídia
+# (ufed:SHA256) acima deste limiar faz o export acrescentar um aviso em
+# `warnings`. É limiar de telemetria (dado, nunca exceção); a superfície
+# de config do fork fica em config.py (M-11) e não controla isto.
+_UNLINK_WARNING_RATIO = 0.5
+
 _WA_HINT = "Use whatsapp_reference para conferir os campos e queries canônicas."
 
 # Placeholders de documentação da whatsapp_reference — nunca enviados ao IPED;
@@ -286,11 +293,16 @@ def _collect_envelope(
         dropped: docs cujo fetch falhou (perda parcial sinalizada).
 
     Returns:
-        Envelope de `op_envelope` sem chave `batch` (sem fatiamento).
+        Envelope de `op_envelope` sem chave `batch` (sem fatiamento), mais
+        `unclassified_messages` — telemetria M-19 da premissa de
+        classificacao: mensagens cujo `name` a regex nao classificou (kind
+        "other"); volume anormal = formato do `name` derivou (D-16).
     """
-    return op_envelope(
+    envelope = op_envelope(
         started_at, scanned=len(records) + dropped, processed=len(records)
     )
+    envelope["unclassified_messages"] = sum(1 for r in records if r.kind == "other")
+    return envelope
 
 
 def _overview_conversations(
@@ -665,6 +677,79 @@ def _export_window(start: str | None, end: str | None) -> tuple[str, str] | None
     return normalize_range(start, end)
 
 
+def _unlink_counters(
+    selected: list[MessageRecord], media: dict[str, dict[str, Any]]
+) -> dict[str, int]:
+    """Contadores de desvinculação mídia↔mensagem do export (telemetria M-19).
+
+    A premissa do vínculo é `linkedItems "sha-256:..." ⇄ ufed:SHA256`
+    (collect.py); quando uma referência não resolve como doc de mídia, a
+    mensagem sai do artefato sem anexo em silêncio (D-15). Os contadores
+    tornam essa perda visível SEM mudar o comportamento do export — o
+    "continue" silencioso do laço de mídia passa a ter contagem equivalente
+    aqui, calculada de uma vez sobre selecionadas × mídia resolvida.
+
+    Args:
+        selected: mensagens selecionadas para o export (ordem cronológica).
+        media: anexos resolvidos por sha-256 (saída de `_fetch_media`;
+            hash ausente = mídia não resolvida).
+
+    Returns:
+        {"media_links_total": refs sha-256 somadas nas mensagens,
+         "media_links_unresolved": refs sem doc de mídia resolvido,
+         "messages_with_unresolved_media": mensagens com ≥1 ref perdida}.
+    """
+    total = 0
+    unresolved = 0
+    messages_unresolved = 0
+    for rec in selected:
+        rec_has_unresolved = False
+        for h in rec.linked_hashes:
+            total += 1
+            if h not in media:
+                unresolved += 1
+                rec_has_unresolved = True
+        if rec_has_unresolved:
+            messages_unresolved += 1
+    return {
+        "media_links_total": total,
+        "media_links_unresolved": unresolved,
+        "messages_with_unresolved_media": messages_unresolved,
+    }
+
+
+def _unlink_warning(counters: dict[str, int]) -> str | None:
+    """Aviso quando a taxa de desvinculação passa do limiar (M-19; nunca lança).
+
+    O contrato é dado no retorno da tool: acima do limiar o export ganha a
+    chave `warnings` com o texto; abaixo (ou sem links), None e nenhum
+    comportamento muda — nunca uma exceção.
+
+    Args:
+        counters: saída de `_unlink_counters`.
+
+    Returns:
+        Texto de aviso quando `media_links_unresolved / media_links_total`
+        EXCEDE `_UNLINK_WARNING_RATIO`; None no limiar, abaixo, ou quando
+        não há links a avaliar.
+    """
+    total = counters["media_links_total"]
+    unresolved = counters["media_links_unresolved"]
+    if total == 0 or unresolved / total <= _UNLINK_WARNING_RATIO:
+        return None
+    pct = round(100.0 * unresolved / total)
+    return (
+        f"{unresolved}/{total} referências de mídia das mensagens ({pct}%) não "
+        'resolvem como docs de mídia (linkedItems "sha-256:..." ⇄ '
+        f"ufed:SHA256), acima do limiar de {_UNLINK_WARNING_RATIO:.0%}: a "
+        "premissa do vínculo ou a classificação de conversa (regex do `name` "
+        "+ `Communication:Date`) pode ter derivado de formato. Antes de "
+        "confiar no artefato, confira um hash via iped_search "
+        "(ufed:SHA256) e a classificação em whatsapp_overview "
+        "(unclassified_messages)."
+    )
+
+
 def _selected_hashes(selected: list[MessageRecord]) -> list[str]:
     """Hashes de mídia das mensagens, únicos e em ordem de aparição.
 
@@ -807,6 +892,14 @@ def whatsapp_export_conversation(
             sem o parâmetro, usa `$IPED_MCP_EXPORTS_DIR`).
         overwrite: True permite reescrever o MESMO JSON na reexecução
             (default False: nome único com timestamp UTC, sem sobrescrita).
+
+    Retorna (telemetria M-19): além do caminho do artefato, o resultado traz
+    `media_links_total`, `media_links_unresolved`,
+    `messages_with_unresolved_media` e `unclassified_messages` (mensagens
+    cuja regex do `name` não classificou a conversa). Se a taxa de
+    referências não resolvidas EXCEDER `_UNLINK_WARNING_RATIO`, um aviso
+    entra na lista `warnings` — nunca uma exceção: o export continua sendo
+    escrito normalmente (risco nulo; só visibilidade da premissa).
     """
     validation.check_int_range(limit, "limit", 1, validation.DOCS_LIMIT_MAX)
     started_at = time.monotonic()
@@ -826,6 +919,7 @@ def whatsapp_export_conversation(
     selected = conv[:limit]
     fetched = fetch_docs_parallel(source_id, [r.doc_id for r in selected])
     media = _fetch_media(source_id, _selected_hashes(selected))
+    counters = _unlink_counters(selected, media)
     messages = _build_export_messages(selected, fetched, media)
     target, is_abs = _prepare_export_dir(output_dir)
     path = _write_export_json(
@@ -842,6 +936,10 @@ def whatsapp_export_conversation(
     warning = _export_dir_warning(output_dir, target, is_abs)
     if warning:
         result["warning"] = warning
+    unlink_notice = _unlink_warning(counters)
+    if unlink_notice:
+        result["warnings"] = [unlink_notice]
+    result.update(counters)
     result.update(_collect_envelope(started_at, records, dropped))
     return result
 
