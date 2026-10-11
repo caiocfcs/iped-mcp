@@ -126,3 +126,63 @@ TEXT_CAP_BYTES = _positive_int("IPED_MCP_TEXT_CAP", 10 * 1024 * 1024)
 # com o M-17 (Lote 3); aqui só a fonte única + alcance de todas as tools.
 DEFAULT_EXPORTS_DIR = "/tmp/iped_mcp/exports"
 EXPORTS_DIR = os.environ.get("IPED_MCP_EXPORTS_DIR", DEFAULT_EXPORTS_DIR)
+
+
+# --- Bind do servidor MCP (M-12) ----------------------------------------------
+# O bind era hard-coded em main.py (127.0.0.1:8000; D-31): dentro de container
+# (deploy do ICARO) o loopback e inalcançavel do host sem patch. Vira config
+# com env; os DEFAULTS do baseline ficam PRESERVADOS — bind local continua o
+# default seguro, expor e sempre opt-in explicito do operador.
+
+
+def _server_host(env_name: str, default: str) -> str:
+    """Le o host de bind do servidor MCP, validando como texto nao vazio.
+
+    Args:
+        env_name: Nome da variavel de ambiente (``IPED_MCP_HOST``).
+        default: Host usado quando a variavel nao esta no ambiente.
+
+    Returns:
+        O host efetivo de bind (ex.: ``"127.0.0.1"`` ou ``"0.0.0.0"``).
+
+    Raises:
+        ValueError: Valor vazio -- bind em host vazio e ambiguo entre
+            interfaces e trocaria silenciosamente o loopback seguro por um
+            bind aberto; falha na inicializacao com mensagem explicita.
+    """
+    raw = os.environ.get(env_name, default)
+    if not raw.strip():
+        raise ValueError(f"{env_name} nao pode ser vazio (use {default!r} para bind local)")
+    return raw.strip()
+
+
+def _server_port(env_name: str, default: int) -> int:
+    """Le a porta do servidor MCP, validando como inteiro de porta TCP.
+
+    Args:
+        env_name: Nome da variavel de ambiente (``IPED_MCP_PORT``).
+        default: Porta usada quando a variavel nao esta no ambiente.
+
+    Returns:
+        A porta efetiva (``1 <= porta <= MAX_VALID_PORT``).
+
+    Raises:
+        ValueError: Valor nao inteiro ou fora da faixa de porta TCP --
+            fail-fast na inicializacao em vez de erro opaco de bind no
+            meio do startup do servidor.
+    """
+    raw = os.environ.get(env_name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} deve ser um numero de porta (1-{MAX_VALID_PORT}): {raw!r}") from exc
+    if not 1 <= value <= MAX_VALID_PORT:
+        raise ValueError(f"{env_name} deve estar entre 1 e {MAX_VALID_PORT}: {raw!r}")
+    return value
+
+
+DEFAULT_SERVER_HOST = "127.0.0.1"
+DEFAULT_SERVER_PORT = 8000
+MAX_VALID_PORT = 65535
+SERVER_HOST = _server_host("IPED_MCP_HOST", DEFAULT_SERVER_HOST)
+SERVER_PORT = _server_port("IPED_MCP_PORT", DEFAULT_SERVER_PORT)
