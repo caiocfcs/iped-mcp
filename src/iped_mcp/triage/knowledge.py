@@ -1092,3 +1092,208 @@ COMMUNICATION_EMPTY_MESSAGE = (
     "nenhum chat, log de interação ou histórico de busca aproveitável "
     "neste source"
 )
+
+
+# --- T-9 owner_candidates: motor heurístico de dono (DESIGN 09-B §9) -----------
+# Porta o owner_inference_engine.py do ICARO SEM LLM (o LLM do ICARO entra só
+# no resumo geral — fora daqui). Todas as constantes citam a linha do motor
+# (iped-icaro/owner/owner_inference_engine.py).
+
+# Vetos de candidato — palavras institucionais. Origem: engine :16-28.
+OWNER_INSTITUTIONAL_KEYWORDS = frozenset({
+    "ltda", "me", "epp", "sa", "s/a", "cia", "bank", "banco", "corretora",
+    "imobiliaria", "supermercado", "farmacia", "posto", "center", "centro",
+    "integrado", "clinica", "hospital", "escola", "universidade", "prefeitura",
+    "secretaria", "policia", "delegacia", "cartorio", "cartório", "loja",
+    "comercio", "restaurante", "bar", "pizzaria", "padaria", "conveniencia",
+    "mercado", "atacado", "distribuidora", "transportes", "logistica",
+    "construtora", "imoveis", "advogados", "contabilidade", "contadores",
+    # vocabulário bancário/comprovantes (nunca nome de pessoa): :25-27
+    "agencia", "conta", "corrente", "poupanca", "extrato", "comprovante",
+    "operacao", "deposito", "saque", "transferencia",
+})
+
+# SSIDs genéricos (Wi-Fi só pontua quando parece rede pessoal). engine :31-37.
+OWNER_GENERIC_SSIDS = frozenset({
+    "androidap", "android hotspot", "iphone", "ipad", "guest", "visitante",
+    "wifi", "rede", "network", "home", "casa", "office", "escritorio",
+    "tplink", "d-link", "netgear", "asus", "motorola", "samsung", "claro",
+    "vivo", "tim", "oi", "gvt", "net", "virtua", "fleminggatan", "eduroam",
+    "starbucks", "mcdonalds", "shopping",
+})
+
+# Modelos de aparelho — vetam segmento de path (engine :435-439, era literal
+# dentro da função; aqui vira constante pela regra 8).
+OWNER_DEVICE_MODEL_TERMS = frozenset({
+    "iphone", "ipad", "samsung", "galaxy", "motorola", "xiaomi", "lg",
+    "sony", "nokia", "huawei", "oneplus", "pixel", "redmi", "apple",
+})
+
+# IDs de transação/merchant — nunca nomes. engine :40-46 (ordem preservada).
+OWNER_TRANSACTION_ID_PATTERNS = (
+    r"^V-\d{10,}$",        # V-3022158736...
+    r"^FAPLMC\d+",         # FAPLMC0000148...
+    r"^\d{10,}$",          # só números longos
+    r"^[A-Z]{2,}\d{4,}$",  # sigla+dígitos colados
+    r"^[\d\-]{8,}$",       # só dígitos e hífen
+)
+
+# Vocabulário técnico/administrativo + apps (checagem por palavra folded).
+# Origem: engine :51-65.
+OWNER_NON_PERSON_TERMS = frozenset({
+    "arquivo", "arquivos", "indexado", "indexados", "indexacao", "index",
+    "extracao", "celular", "telefone", "fone", "aparelho", "device",
+    "dispositivo", "movel", "imagem", "forense", "laudo", "pericia",
+    "evidencia", "processado", "triagem", "backup", "dump", "ufed",
+    "cellebrite", "relatorio", "apreensao", "busca", "export", "exportacao",
+    "computador", "notebook", "pendrive", "memoria", "cartao", "tabela",
+    "planilha", "grafico", "caso", "queixa", "procedimento", "inquerito",
+    "pix", "jogador", "dinheiro",
+    # apps/mensageiros: ufed:Name de aplicativo nunca é pessoa (:60-64)
+    "whatsapp", "telegram", "signal", "messenger", "facebook", "instagram",
+    "twitter", "tiktok", "snapchat", "discord", "skype", "imo", "viber",
+    "wechat", "kwai", "truecaller", "gmail", "outlook", "hotmail", "yahoo",
+    "icloud", "google", "chrome", "youtube", "email",
+})
+
+# Pesos por feed (base, cap) — engine :151-275, citados um a um no design §9.3.
+OWNER_W_ACCOUNT_MAIN = (70.0, 70.0)     # conta principal do dispositivo :159-160
+OWNER_W_USER_ACCOUNT = (65.0, 65.0)     # ufed:Name em conta de usuário :162-167
+OWNER_W_SIM_MSISDN = (5.0, 5.0)         # linha SIM :170-171
+OWNER_W_WIFI_PERSONAL = (12.0, 15.0)    # Wi-Fi pessoal :174-176
+OWNER_W_SELF_CONTACT = (55.0, 55.0)     # contato com o próprio número :179-183
+OWNER_W_EMAIL_ALIAS = (15.0, 15.0)      # alias de e-mail :189-194
+OWNER_W_PAYER = (18.0, 20.0)            # pagador em transação :204-206
+OWNER_W_PAYEE = (12.0, 15.0)            # recebedor :208-211
+OWNER_W_BENEFICIARY = (15.0, 15.0)      # favorecido em comprovante :213-216
+OWNER_W_CARD_DESC = (20.0, 20.0)        # descrição de cartão :218-221
+OWNER_W_TELEPHONY = (8.0, 10.0)         # telefonia recorrente :223-229
+OWNER_W_INTERLOCUTOR = (5.0, 5.0)       # interlocutor frequente :231-238
+OWNER_W_MEDIA = (10.0, 10.0)            # metadado de mídia :243-252
+OWNER_W_PATH = (60.0, 60.0)             # path (60, não 80: :272-274)
+
+# Rótulos de fonte dos candidatos (texto do engine, literal preservado).
+OWNER_SRC_ACCOUNT_MAIN = "Identidade: conta principal do dispositivo"   # :160
+OWNER_SRC_USER_ACCOUNT = "Identidade: nome em conta de usuário"         # :167
+OWNER_SRC_SIM_MSISDN = "Identidade: SIM MSISDN"                         # :171
+OWNER_SRC_SIM_LINE = "Linha: {msisdn}"                                  # :171
+OWNER_SRC_WIFI = "Identidade: Wi-Fi '{ssid}'"                           # :176
+OWNER_SRC_SELF_CONTACT = "Identidade: contato salvo com próprio número"  # :183
+OWNER_SRC_EMAIL_ALIAS = "Identidade: alias de e-mail"                   # :194
+OWNER_SRC_PAYER = "Financeiro: pagador em transação"                    # :206
+OWNER_SRC_PAYEE = "Financeiro: recebedor"                               # :211
+OWNER_SRC_BENEFICIARY = "Financeiro: favorecido em comprovante"         # :216
+OWNER_SRC_CARD_DESC = "Financeiro: descrição de cartão"                  # :221
+OWNER_SRC_TELEPHONY = "Telefonia: contato recorrente"                   # :229
+OWNER_SRC_INTERLOCUTOR = "Comunicações: interlocutor frequente"         # :238
+# DIVERGÊNCIA documentada (design §9.1 "nenhum dado re-extraído" + D-8): o
+# feed do engine lê Author/Owner/Creator/By-line do raw_properties de cada
+# item (:243-252); o envelope T-6 NÃO publica props brutas (política M-9),
+# então o feed MCP consome a entidade agregada ``owner_media_signals``
+# (chave real da cópia — MEDIA_OWNER_SIGNAL_KEYS, §6.3, mesma família de
+# sinal). OWNER_W_MEDIA (:243-252) é o peso portado.
+OWNER_SRC_MEDIA = "Mídias: titular agregado (owner_media_signals)"
+OWNER_SRC_PATH = "Path do documento: '{seg}'"                           # :274
+
+# Seções/keys consumidas dos envelopes-membro (formas §3.7/§4.6/§6.5/§8.6).
+OWNER_SECTION_IDENTITY = "identity"                    # envelope T-3
+OWNER_SECTION_RECOGNIZED = "recognized_devices"        # envelope T-3 (paths)
+OWNER_SECTION_EVIDENCES = "evidences"                  # envelope T-4
+OWNER_SECTION_CARDS = "cards"                          # envelope T-4
+OWNER_SECTION_ACCOUNTS = "accounts"                    # envelope T-4
+OWNER_SECTION_RANKED_ITEMS = "ranked_items"            # envelope T-6 (paths)
+OWNER_SECTION_MEDIA_SIGNALS = "owner_media_signals"    # envelope T-6
+OWNER_SECTION_CHATS = "chats"                          # envelope T-8
+OWNER_SECTION_TELEPHONY_CONTACTS = "top_contacts"      # envelope T-1 (paridade)
+OWNER_FIELD_SIM_MSISDN = "sim_msisdn"
+OWNER_FIELD_WIFI_NETWORKS = "wifi_networks"
+OWNER_FIELD_EMAILS = "emails"
+OWNER_FIELD_CONTACTS_SAMPLE = "known_contacts_sample"
+OWNER_FIELD_PAYER = "payer"
+OWNER_FIELD_PAYEE = "payee"
+OWNER_FIELD_BENEFICIARY = "beneficiary"
+OWNER_FIELD_DESCRIPTION = "description"
+OWNER_FIELD_INTERLOCUTOR = "interlocutor"
+OWNER_FIELD_MESSAGE_COUNT = "message_count"
+OWNER_FIELD_CHAT_TOTAL = "chat_total_messages"
+OWNER_FIELD_CONTACT_NAME = "contact_name"
+OWNER_FIELD_TOTAL_CALLS = "total_calls"
+OWNER_FIELD_PHONE = "phone"
+OWNER_ALIAS_REPLACEMENT = " "                   # '.'/'_' → espaço no alias :191
+
+# Limiares e tetos do motor.
+OWNER_MIN_NAME_LEN = 3                        # :283 (len(name) < 3 descarta)
+OWNER_NAME_DOT_FORBIDDEN = "."                # regra absoluta :285-289
+OWNER_TECH_TOKEN_MIN = 8                      # hex/UUID longo :360
+OWNER_ID_DIGITS_MIN = 8                       # mais dígitos que letras :397
+OWNER_WIFI_HEX_MIN = 6                        # SSID hexadecimal :445
+OWNER_MEDIA_VALUE_MIN_LEN = 3                 # len(val) > 3 no feed de mídia :251
+OWNER_TELEPHONY_CALLS_MIN = 20                # :228 (strict >)
+OWNER_COMMUNICATION_MSG_MIN = 100             # :235 (strict >)
+OWNER_PATH_PART_MIN_LEN = 5                   # :260 (len(part) <= 5 descarta)
+OWNER_PATH_SEGMENT_MIN_LEN = 5                # :266 (len(seg) < 5 descarta)
+OWNER_TITLE_CONVERT_MIN = 3                   # upper→title :383
+OWNER_FAMILY_REINFORCE_MAX = 3                # reforço por família de fonte :310-312
+OWNER_PENALTY_FACTOR = 0.3                    # vencedor só-Financeiro :117-121
+OWNER_PENALTY_SCORE_MIN = 100.0               # :118 (strict >)
+OWNER_PENALTY_SOURCE_MARKER = "Financeiro"    # :118
+OWNER_CONF_ALTA_MIN = 60                      # :449-454
+OWNER_CONF_MEDIA_MIN = 35                     # :452
+OWNER_CANDIDATES_MAX = 5                      # :127-130 (winner + até 4)
+OWNER_SOURCES_VIEW = 3                        # sources[:3] por candidato :458
+OWNER_SCORE_ROUND_DIGITS = 1                  # round(score, 1) do engine :126
+
+# Avisos/mensagens do motor (aviso do engine :119 vira warning no envelope).
+OWNER_PENALTY_WARNING_TEMPLATE = (
+    "vencedor '{name}' veio só de fontes financeiras (provável ID de "
+    "merchant); score ×{factor}"
+)
+OWNER_EMPTY_MESSAGE = (
+    "nenhum candidato de nome plausível encontrado nos eixos varridos"
+)
+OWNER_AXIS_FAILED_TEMPLATE = "eixo {axis} indisponível: {error}"
+OWNER_MEMBER_WARNING_PREFIX = "{tool}: "
+OWNER_EVIDENCE_TEMPLATE = "Nome '{name}' eleito com score {score:.1f}."
+OWNER_EVIDENCE_SOURCES_PREFIX = "Fontes: "
+OWNER_EVIDENCE_SOURCES_JOIN = "; "
+OWNER_BUDGET_WARNING_TEMPLATE = (
+    "http_budget_exceeded: orçamento composto estourado ({used} GETs, cap "
+    "{cap}); resultados PARCIAIS"
+)
+
+# Regex do motor (uma definição cada; engine :281-447).
+OWNER_RE_STRIP_EMAIL = r"\S+@\S+"                              # :371
+OWNER_RE_STRIP_CPF = r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b"          # :373
+OWNER_RE_STRIP_CNPJ = r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b"   # :374
+OWNER_RE_STRIP_PHONE = r"\(?\d{2,3}\)?[-.\s]?\d{4,5}[-.]?\d{4}"  # :376
+OWNER_RE_STRIP_LONG_DIGITS = r"\b\d{10,}\b"                    # :378
+OWNER_RE_KEEP_CHARS = r"[^\w\s\-\.]"                           # :380
+OWNER_RE_WHITESPACE = r"\s+"                                   # :381
+OWNER_RE_PACKAGE_PREFIX = r"^(com|org|net|gov|br|android|java|kotlin)\."  # :357
+OWNER_RE_HEX_ARTIFACT = r"[0-9a-f\-\.]+"                       # :361 (fullmatch)
+OWNER_RE_INSTITUTIONAL_ACRONYM = r"^[A-Z]{1,5}$"               # :408
+OWNER_RE_WORD = r"\w+"                                         # :341/:405
+OWNER_RE_DIGIT = r"\d"                                         # :429
+OWNER_RE_COMPACT_KEY = r"[\s\.\-_]+"                           # :301
+OWNER_RE_SSID_HEX = r"^[0-9a-f]{6,}$"                          # :445
+OWNER_RE_PATH_SEGMENT = r"\s+[-–]\s+"                          # :264
+OWNER_PATH_DASH_MARKERS = (" - ", "\u2013")                    # :260 (" - " ou "–")
+OWNER_FAMILY_SEPARATOR = ":"                                   # :311
+
+# Ferramentas-membro do T-9 (o custo é a união dos http_calls; §2.2). O teto
+# composto é DERIVADO — existe só para o envelope reportar (T-9 não faz HTTP
+# próprio além dos membros; cada membro já para no SEU orçamento).
+OWNER_MEMBER_TOOLS = (
+    "triage_identity", "triage_communication", "triage_financial",
+    "triage_media",
+)
+OWNER_BUDGET = sum(TOOL_BUDGETS[tool] for tool in OWNER_MEMBER_TOOLS)  # 18300
+
+# Limiares complementares do motor (adicionados nesta implementação — o
+# engine os tinha como literais no corpo das funções; regra 8).
+OWNER_NAME_SHORT_LEN_MIN = 5            # engine :422 (len(text) < 5 descarta)
+OWNER_NAME_WORD_MIN_LEN = 3             # engine :424 (alguma palavra >= 3)
+OWNER_ALIAS_STRIP_CHARS = (".", "_")    # engine :191 ('.'/'_' → espaço)
+OWNER_RE_NON_DIGIT = r"\D"              # engine :180-181 (dígitos p/ MSISDN)
+OWNER_EVIDENCE_SOURCES_SUFFIX = "."     # engine :459 (fecho da frase)
+OWNER_ACCOUNT_NAME_MIN_LEN = 3          # engine :159 (len(entity.name) > 2)

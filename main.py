@@ -9,6 +9,7 @@ from iped_mcp.core import register as register_core
 from iped_mcp.regex import register as register_regex
 from iped_mcp.router import RouterStartupError, get_router
 from iped_mcp.triage import register as register_triage
+from iped_mcp.triage.owner import register as register_owner
 from iped_mcp.ufed import register as register_ufed
 from iped_mcp.whatsapp import register as register_whatsapp
 
@@ -46,7 +47,7 @@ mcp = FastMCP(
         "whatsapp_reference documenta os campos e queries canônicas validados. "
         "A família triage_ traz triagem pronta sem LLM: triage_telephony agrega "
         "chamadas/contatos por número e devolve o top contatos com score e "
-        "relevância (tetos e truncamento sempre marcados na resposta); triage_identity traz a identidade principal (contas, e-mails, telefones, SIM/Wi-Fi/Bluetooth, device_info padronizado, agenda) com score por confiança mais os dispositivos reconhecidos pela conta de nuvem; triage_financial extrai evidências financeiras (valores/PIX/contas por detectores Regex), cartões com transações agregadas e contas financeiras com score e relevância; triage_geolocation agrupa coordenadas GPS em clusters com ocorrências, período e relevância (Null Island descartada; sem país — ferramenta externa ao contrato); triage_media ranqueia a mídia por 12 sinais (OCR, rosto, nudez, transcrito, CPF, telefone, URL, GPS, ext divergente, carved, deletado, download financeiro) com contagem por categoria, apps e titulares vistos em mídia; triage_devices_networks agrega logs de rede (conexões por IP com colapso IPv6 /64, serviços iCloud, fingerprints de aparelho), redes wifi e dispositivos bluetooth — somente agregados, nunca a timeline bruta; triage_communication agrega chats por interlocutor (grupos sempre, indivíduos no topo por interações) com score por termos investigativos opcionais mais histórico de busca dos navegadores, agregado-v1 sem o texto das mensagens; transcripts_generate grava o arquivo de transcrições de áudio (metadado audio:transcription) no disco de exports e devolve metadados + preview \" o texto completo nunca vai na resposta\""
+        "relevância (tetos e truncamento sempre marcados na resposta); triage_identity traz a identidade principal (contas, e-mails, telefones, SIM/Wi-Fi/Bluetooth, device_info padronizado, agenda) com score por confiança mais os dispositivos reconhecidos pela conta de nuvem; triage_financial extrai evidências financeiras (valores/PIX/contas por detectores Regex), cartões com transações agregadas e contas financeiras com score e relevância; triage_geolocation agrupa coordenadas GPS em clusters com ocorrências, período e relevância (Null Island descartada; sem país — ferramenta externa ao contrato); triage_media ranqueia a mídia por 12 sinais (OCR, rosto, nudez, transcrito, CPF, telefone, URL, GPS, ext divergente, carved, deletado, download financeiro) com contagem por categoria, apps e titulares vistos em mídia; triage_devices_networks agrega logs de rede (conexões por IP com colapso IPv6 /64, serviços iCloud, fingerprints de aparelho), redes wifi e dispositivos bluetooth — somente agregados, nunca a timeline bruta; triage_communication agrega chats por interlocutor (grupos sempre, indivíduos no topo por interações) com score por termos investigativos opcionais mais histórico de busca dos navegadores, agregado-v1 sem o texto das mensagens; owner_candidates roda o motor heurístico de dono do ICARO (sem LLM) sobre os 4 eixos triage (identidade, financeiro, mídia, comunicação) e devolve até 5 candidatos a proprietário do dispositivo com score, fontes, confiança e penalidade para vencedor vindo só do financeiro; ; transcripts_generate grava o arquivo de transcrições de áudio (metadado audio:transcription) no disco de exports e devolve metadados + preview \" o texto completo nunca vai na resposta\""
     ),
 )
 
@@ -56,6 +57,7 @@ register_regex(mcp)
 register_bookmarks(mcp)
 register_whatsapp(mcp)
 register_triage(mcp)
+register_owner(mcp)
 
 
 def main() -> None:
