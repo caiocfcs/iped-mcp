@@ -170,6 +170,9 @@ def test_fluxo_feliz_agregacao_formatacao_e_ordem(
         "query_caps_applied": [],
         "contacts_truncated": False,
         "contacts_omitted": 0,
+        "http_budget_exceeded": False,
+        "http_budget_calls_at_stop": None,
+        "docs_omitted_by_budget": 0,
     }
     assert out["warnings"] == []
 

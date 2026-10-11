@@ -34,10 +34,10 @@ from iped_mcp.progress import PHASE_PARTIAL, op_envelope
 from iped_mcp.router import get_router
 from iped_mcp.triage import knowledge
 from iped_mcp.triage.fields import first_str
-from iped_mcp.triage.identity import (
-    _Budget,
-    _budget_warnings,
-    _fetch_within_budget,
+from iped_mcp.triage.budget import (
+    HttpBudget as _Budget,
+    budget_warnings as _budget_warnings,
+    fetch_within_budget as _fetch_within_budget,
 )
 
 _SEARCH_HINT = (

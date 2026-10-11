@@ -105,7 +105,12 @@ def test_fluxo_feliz_formato_ordem_dedup(
     assert (out["audio_docs"], out["with_transcript"],
             out["without_transcript"], out["duplicates"]) == (5, 3, 1, 1)
     assert out["preview_truncated"] is False
-    assert out["truncated"] == {"scan_cap_applied": False}
+    assert out["truncated"] == {
+        "scan_cap_applied": False,
+        "http_budget_exceeded": False,
+        "http_budget_calls_at_stop": None,
+        "docs_omitted_by_budget": 0,
+    }
     assert out["warnings"] == []
     assert out["counters"]["docs_fetched"] == 5
     name = os.path.basename(out["file_path"])

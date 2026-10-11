@@ -7,7 +7,9 @@ deduplica por hash, ordena no tempo e materializa o arquivo de blocos no
 disco de exports (padrão M-10: nome UTC/source, no-clobber). CONTRATO DE
 CONTEXTO (DESIGN 09 §3.4): o texto completo NUNCA vai na resposta MCP — a
 resposta traz metadados + preview de ``PREVIEW_CHARS`` sempre marcado.
-Nenhum LLM e nenhum Whisper: só se lê o que o IPED já transcreveu.
+Nenhum LLM e nenhum Whisper: só se lê o que o IPED já transcreveu. A
+varredura roda sob o orçamento R-TRIAGE-1 (``counters.http_calls``;
+estouro → partial + warning, nunca exceção).
 """
 
 from __future__ import annotations
@@ -22,8 +24,13 @@ from typing import Any
 from fastmcp import FastMCP
 
 from iped_mcp import download, fetch
-from iped_mcp.progress import op_envelope
+from iped_mcp.progress import PHASE_PARTIAL, op_envelope
 from iped_mcp.router import get_router
+from iped_mcp.triage.budget import (
+    HttpBudget as _Budget,
+    budget_warnings as _budget_warnings,
+    fetch_within_budget as _fetch_within_budget,
+)
 from iped_mcp.triage.fields import first_str
 from iped_mcp.triage import knowledge
 
@@ -152,16 +159,24 @@ def _consume_pairs(
         records.append(_audio_record(props, text, hash_value))
 
 
-def _collect_records(sid: str, sweep: _Sweep) -> list[_AudioRecord]:
+def _collect_records(
+    sid: str, sweep: _Sweep, budget: _Budget, docs_omitted: list[int]
+) -> list[_AudioRecord]:
     """Varre as queries candidatas até a primeira produzir registros.
 
     Fallback só quando a query anterior não produziu nada
     (service:165-166); query que falha vira warning e o fallback segue
-    (tolerância do service:167-170).
+    (tolerância do service:167-170). O orçamento R-TRIAGE-1 (retrofit,
+    DESIGN 09-B §2.3) encerra a varredura no cap sem exceção: o artefato
+    sai com o que foi coletado e o warning/parcial são marcados no
+    envelope.
 
     Args:
         sid: source já resolvido (M-2).
         sweep: contadores da varredura (mutado).
+        budget: orçamento de GET (mutado; /search e /docs contam 1).
+        docs_omitted: saída do contrato fetch_within_budget (quantidade
+            em [0]) — docs que não couberam no orçamento.
 
     Returns:
         Registros dos áudios transcritos (ordem de varredura).
@@ -169,15 +184,20 @@ def _collect_records(sid: str, sweep: _Sweep) -> list[_AudioRecord]:
     records: list[_AudioRecord] = []
     seen: set[str] = set()
     for query in knowledge.AUDIO_QUERIES:
+        if not budget.allows():
+            budget.exceeded = True
+            break
         try:
             ids = fetch.search_ids(query, sid, hint=_SEARCH_HINT)
         except ValueError as exc:
             sweep.warnings.append(f"query {query} falhou: {exc}")
+            budget.record()
             continue
+        budget.record()
         if len(ids) > knowledge.AUDIO_SCAN_MAX_DOCS:
             ids = ids[: knowledge.AUDIO_SCAN_MAX_DOCS]
             sweep.scan_cap_applied = True
-        pairs = fetch.fetch_docs_parallel(sid, ids)
+        pairs = _fetch_within_budget(sid, ids, budget, docs_omitted)
         sweep.docs_fetched += sum(1 for _, props in pairs if props is not None)
         _consume_pairs(pairs, records, seen, sweep)
         if records:
@@ -225,7 +245,8 @@ def _preview(content: str) -> tuple[str, bool]:
 
 
 def _zero_payload(
-    sid: str, started: float, sweep: _Sweep
+    sid: str, started: float, sweep: _Sweep, budget: _Budget,
+    docs_omitted: list[int],
 ) -> dict[str, Any]:
     """Contrato zero (áudio nenhum ou nenhum transcrito): não grava nada.
 
@@ -233,6 +254,8 @@ def _zero_payload(
         sid: source triado.
         started: ``time.monotonic()`` do início.
         sweep: contadores da varredura.
+        budget: orçamento R-TRIAGE-1 da chamada (counters.http_calls).
+        docs_omitted: docs sem props por orçamento (quantidade em [0]).
 
     Returns:
         Envelope com ``file_path=None`` e ``message`` nomeando o metadado
@@ -242,6 +265,8 @@ def _zero_payload(
         sid,
         started,
         sweep,
+        budget,
+        docs_omitted,
         file_path=None,
         with_transcript=0,
         file_bytes=0,
@@ -255,6 +280,8 @@ def _payload(
     sid: str,
     started: float,
     sweep: _Sweep,
+    budget: _Budget,
+    docs_omitted: list[int],
     *,
     file_path: str | None,
     with_transcript: int,
@@ -269,6 +296,8 @@ def _payload(
         sid: source processado.
         started: ``time.monotonic()`` do início (contadores M-9).
         sweep: contadores da varredura.
+        budget: orçamento R-TRIAGE-1 da chamada.
+        docs_omitted: docs sem props por orçamento (quantidade em [0]).
         file_path: artefato gravado (None no contrato zero).
         with_transcript: áudios únicos com transcrição no arquivo.
         file_bytes: tamanho do artefato (0 no contrato zero).
@@ -277,9 +306,10 @@ def _payload(
         message: texto explicativo do contrato zero (None no caso normal).
 
     Returns:
-        Envelope JSON-serializável com ``counters`` (op_envelope M-9) e
-        ``truncated.scan_cap_applied`` (teto de varredura sempre marcado).
+        Envelope JSON-serializável com ``counters`` (op_envelope M-9,
+        http_calls R-TRIAGE-1) e ``truncated`` (tetos sempre marcados).
     """
+    sweep.warnings.extend(_budget_warnings(budget, docs_omitted))
     payload: dict[str, Any] = {
         "source_id": sid,
         "file_path": file_path,
@@ -295,13 +325,25 @@ def _payload(
                 started, scanned=sweep.audio_docs, processed=with_transcript
             ),
             docs_fetched=sweep.docs_fetched,
+            http_calls=budget.used,
             cached=False,
         ),
-        "truncated": {"scan_cap_applied": sweep.scan_cap_applied},
+        "truncated": {
+            "scan_cap_applied": sweep.scan_cap_applied,
+            "http_budget_exceeded": budget.exceeded,
+            "http_budget_calls_at_stop": (
+                budget.used if budget.exceeded else None
+            ),
+            # docs_omitted carrega a QUANTIDADE num único elemento
+            # (contrato fetch_within_budget) — por isso sum(), não len().
+            "docs_omitted_by_budget": sum(docs_omitted),
+        },
         "warnings": list(sweep.warnings),
     }
     if message is not None:
         payload["message"] = message
+    if budget.exceeded:
+        payload["counters"]["phase"] = PHASE_PARTIAL
     return payload
 
 
@@ -328,9 +370,11 @@ def build_transcripts(
     get_router().resolve(sid)  # M-2 antes de qualquer HTTP de busca (§2.6)
     started = time.monotonic()
     sweep = _Sweep()
-    records = _collect_records(sid, sweep)
+    budget = _Budget(knowledge.TOOL_BUDGETS["transcripts_generate"])
+    docs_omitted: list[int] = []
+    records = _collect_records(sid, sweep, budget, docs_omitted)
     if not records:
-        return _zero_payload(sid, started, sweep)
+        return _zero_payload(sid, started, sweep, budget, docs_omitted)
     content = _build_file_content(records)
     path = download.export_path(
         dest_dir, sid, knowledge.TRANSCRIPT_FILE_BASENAME, ext=".txt"
@@ -342,6 +386,8 @@ def build_transcripts(
         sid,
         started,
         sweep,
+        budget,
+        docs_omitted,
         file_path=path,
         with_transcript=len(records),
         file_bytes=os.path.getsize(path),

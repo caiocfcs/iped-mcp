@@ -28,6 +28,7 @@ from fastmcp import FastMCP
 from iped_mcp import fetch, progress
 from iped_mcp.progress import op_envelope
 from iped_mcp.router import get_router
+from iped_mcp.triage import budget as _budget
 from iped_mcp.triage import knowledge
 from iped_mcp.triage.fields import first_str, first_str_key
 
@@ -38,11 +39,13 @@ _NAME_COVERAGE_WARNING = (
     "campos de nome testados sem cobertura ({fields}); {docs} docs "
     "varridos — identidade usará apenas os fallbacks de conta/e-mail"
 )
-_BUDGET_OMITTED_DOCS = (
-    "{count} documentos ficaram sem varredura de propriedades (cap "
-    "tingido no lote de GETs /docs)"
-)
-_BUDGET_OMITTED_QUERIES = "demais categorias de identidade não consultadas"
+# Retrofit R-TRIAGE-1: o mecanismo vive em triage/budget.py (DESIGN 09-B
+# §2.3, módulo próprio por responsabilidade). Os aliases privados abaixo
+# preservam o contrato de import usado pelas demais tools (identity foi o
+# berço do contador na onda B-1); nenhum muda o comportamento.
+_Budget = _budget.HttpBudget
+_budget_warnings = _budget.budget_warnings
+_fetch_within_budget = _budget.fetch_within_budget
 
 
 @dataclass
@@ -102,49 +105,6 @@ class _Scan:
     )
     name_candidates: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-
-
-class _Budget:
-    """Orçamento de GET internos desta chamada (DESIGN 09-B §2.3).
-
-    Attributes:
-        cap: teto efetivo da tool (``knowledge.TOOL_BUDGETS``).
-        used: GETs realmente emitidos até aqui (/search e /docs contam 1).
-        exceeded: True quando o fluxo parou por atingir o cap (nunca é
-            exceção nem silencioso: vira ``truncated`` + warning).
-    """
-
-    def __init__(self, cap: int) -> None:
-        """Inicializa com o teto efetivo da tool.
-
-        Args:
-            cap: nº máximo de GET internos permitido nesta chamada.
-        """
-        self.cap = cap
-        self.used = 0
-        self.exceeded = False
-
-    def allows(self, cost: int = 1) -> bool:
-        """Diz se ainda cabem ``cost`` GETs no orçamento.
-
-        Args:
-            cost: requisições que o chamador pretende emitir.
-
-        Returns:
-            True quando ``used + cost`` não ultrapassa o cap.
-        """
-        return self.used + cost <= self.cap
-
-    def record(self, cost: int = 1) -> None:
-        """Conta ``cost`` GETs emitidos (tráfego real, não trabalho lógico).
-
-        Args:
-            cost: requisições efetivamente emitidas.
-
-        Returns:
-            Nada.
-        """
-        self.used += cost
 
 
 def _ufed_source(props: dict[str, Any]) -> str:
@@ -1143,30 +1103,6 @@ def _collect_candidate_ids(sid: str, scan: _Scan, budget: _Budget) -> list[int]:
     return list(seen)
 
 
-def _fetch_within_budget(
-    sid: str, ids: list[int], budget: _Budget, omitted: list[int]
-) -> list[tuple[int, dict | None]]:
-    """Varre as props respeitando o GET restante do orçamento (§2.3).
-
-    Args:
-        sid: source resolvido.
-        ids: candidatos na ordem de descoberta.
-        budget: orçamento de GET (mutado; cada /docs conta 1).
-        omitted: lista de saída com o nº de docs que ficaram de fora.
-
-    Returns:
-        Pares ``(doc_id, properties|None)`` dos docs efetivamente buscados.
-    """
-    remaining = max(budget.cap - budget.used, 0)
-    if len(ids) > remaining:
-        budget.exceeded = True
-        omitted.append(len(ids) - remaining)
-        ids = ids[:remaining]
-    pairs = fetch.fetch_docs_parallel(sid, ids)
-    budget.record(len(ids))
-    return pairs
-
-
 def _name_coverage_warnings(scan: _Scan) -> list[str]:
     """Pré-sonda §3.2: cobertura zero de nome com docs varridos > 0.
 
@@ -1186,31 +1122,6 @@ def _name_coverage_warnings(scan: _Scan) -> list[str]:
             )
         ]
     return []
-
-
-def _budget_warnings(budget: _Budget, docs_omitted: list[int]) -> list[str]:
-    """Aviso canônico de estouro do orçamento (§2.3; nunca exceção).
-
-    Args:
-        budget: orçamento da chamada.
-        docs_omitted: nº de docs sem props por causa do cap (0 = parou nas
-            queries).
-
-    Returns:
-        Warning com cap, contagem e o que ficou de fora; vazio sem estouro.
-    """
-    if not budget.exceeded:
-        return []
-    omitted = (
-        _BUDGET_OMITTED_DOCS.format(count=docs_omitted[0])
-        if docs_omitted
-        else _BUDGET_OMITTED_QUERIES
-    )
-    return [
-        knowledge.HTTP_BUDGET_WARNING_TEMPLATE.format(
-            calls=budget.used, cap=budget.cap, omitted=omitted
-        )
-    ]
 
 
 def _payload(

@@ -5,7 +5,8 @@ categorias canônicas (:mod:`iped_mcp.triage.knowledge`), agrega chamadas e
 contatos de agenda por número (semântica de ``_normalize_entities``,
 iped-icaro/strategies/telephony_strategy.py:50-135) e classifica por peso
 (draft_report_iped_manager.py:914-929). Nenhum LLM, nenhum arquivo do caso:
-somente GET /search e GET /docs/{id} do client.
+somente GET /search e GET /docs/{id} do client, sob o orçamento
+R-TRIAGE-1 (``counters.http_calls``; estouro → partial + warning).
 """
 
 from __future__ import annotations
@@ -18,9 +19,14 @@ from typing import Any
 from fastmcp import FastMCP
 
 from iped_mcp import fetch
-from iped_mcp.progress import op_envelope
+from iped_mcp.progress import PHASE_PARTIAL, op_envelope
 from iped_mcp.router import get_router
 from iped_mcp.triage import knowledge
+from iped_mcp.triage.budget import (
+    HttpBudget as _Budget,
+    budget_warnings as _budget_warnings,
+    fetch_within_budget as _fetch_within_budget,
+)
 from iped_mcp.triage.fields import first_str, first_str_key
 
 _KIND_CALL = "call"
@@ -222,26 +228,35 @@ def _classify(props: dict[str, Any]) -> str | None:
     return None
 
 
-def _collect_candidate_ids(sid: str, scan: _Scan) -> list[int]:
+def _collect_candidate_ids(
+    sid: str, scan: _Scan, budget: _Budget
+) -> list[int]:
     """Busca as categorias canônicas com dedup global e tetos (§2.3.2).
 
     Args:
         sid: source já resolvido (M-2).
         scan: contadores da varredura (mutado; query falha vira warning e
             hits -1, espelho base_strategy.py:122-123).
+        budget: orçamento de GET (mutado; cada /search conta 1 — retrofit
+            R-TRIAGE-1, DESIGN 09-B §2.3; estouro nunca é exceção).
 
     Returns:
         ids únicos na ordem de descoberta, até ``TOTAL_CANDIDATE_CAP``.
     """
     seen: dict[int, None] = {}
     for category in knowledge.TELEPHONY_CATEGORIES:
+        if not budget.allows():
+            budget.exceeded = True
+            break
         query = knowledge.TELEPHONY_QUERY_TEMPLATE.format(category=category)
         try:
             ids = fetch.search_ids(query, sid, hint=_SEARCH_HINT)
         except ValueError as exc:
             scan.warnings.append(f"query {query} falhou: {exc}")
             scan.query_hits[query] = -1
+            budget.record()
             continue
+        budget.record()
         scan.query_hits[query] = len(ids)
         if len(ids) > knowledge.CATEGORY_QUERY_CAP:
             scan.query_caps.append(query)
@@ -400,7 +415,12 @@ def _zero_hit_warnings(scan: _Scan) -> list[str]:
 
 
 def _payload(
-    sid: str, started: float, rows: list[dict[str, Any]], scan: _Scan
+    sid: str,
+    started: float,
+    rows: list[dict[str, Any]],
+    scan: _Scan,
+    budget: _Budget,
+    docs_omitted: list[int],
 ) -> dict[str, Any]:
     """Monta o envelope final (§2.5): contadores M-9 + truncamento marcado.
 
@@ -409,6 +429,8 @@ def _payload(
         started: ``time.monotonic()`` do início da operação.
         rows: contatos já ordenados.
         scan: contadores da varredura.
+        budget: orçamento R-TRIAGE-1 da chamada (counters.http_calls).
+        docs_omitted: docs sem props por orçamento (quantidade em [0]).
 
     Returns:
         Envelope com ``contacts`` limitado a ``TOP_CONTACTS`` (omissão
@@ -416,7 +438,8 @@ def _payload(
     """
     scan.warnings.extend(_zero_hit_warnings(scan))
     scan.warnings.extend(_name_origin_warnings(scan))
-    return {
+    scan.warnings.extend(_budget_warnings(budget, docs_omitted))
+    payload: dict[str, Any] = {
         "source_id": sid,
         "contacts": rows[: knowledge.TOP_CONTACTS],
         "query_hits": dict(scan.query_hits),
@@ -432,6 +455,7 @@ def _payload(
             contact_docs=scan.contact_docs,
             contact_name_field_hits=dict(scan.contact_name_field_hits),
             contacts_total=len(rows),
+            http_calls=budget.used,
             cached=False,
         ),
         "truncated": {
@@ -439,6 +463,13 @@ def _payload(
             "query_caps_applied": list(scan.query_caps),
             "contacts_truncated": len(rows) > knowledge.TOP_CONTACTS,
             "contacts_omitted": max(len(rows) - knowledge.TOP_CONTACTS, 0),
+            "http_budget_exceeded": budget.exceeded,
+            "http_budget_calls_at_stop": (
+                budget.used if budget.exceeded else None
+            ),
+            # docs_omitted carrega a QUANTIDADE num único elemento
+            # (contrato fetch_within_budget) — por isso sum(), não len().
+            "docs_omitted_by_budget": sum(docs_omitted),
         },
         "warnings": list(scan.warnings),
         **(
@@ -447,6 +478,9 @@ def _payload(
             else {}
         ),
     }
+    if budget.exceeded:
+        payload["counters"]["phase"] = PHASE_PARTIAL
+    return payload
 
 
 def build_triage_telephony(source_id: str) -> dict[str, Any]:
@@ -468,12 +502,14 @@ def build_triage_telephony(source_id: str) -> dict[str, Any]:
     get_router().resolve(sid)  # M-2 antes de qualquer HTTP de busca (§2.3.1)
     started = time.monotonic()
     scan = _Scan()
-    ids = _collect_candidate_ids(sid, scan)
-    pairs = fetch.fetch_docs_parallel(sid, ids)
+    budget = _Budget(knowledge.TOOL_BUDGETS["triage_telephony"])
+    ids = _collect_candidate_ids(sid, scan, budget)
+    omitted: list[int] = []
+    pairs = _fetch_within_budget(sid, ids, budget, omitted)
     scan.docs_searched = len(ids)
     scan.docs_fetched = sum(1 for _, props in pairs if props is not None)
     rows = _rank_contacts(_aggregate(pairs, scan))
-    return _payload(sid, started, rows, scan)
+    return _payload(sid, started, rows, scan, budget, omitted)
 
 
 def triage_telephony(source_id: str) -> dict[str, Any]:

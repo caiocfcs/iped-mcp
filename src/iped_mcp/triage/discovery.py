@@ -35,7 +35,7 @@ from iped_mcp.progress import op_envelope
 from iped_mcp.regex.queries import KNOWN_TYPES, build_regex_query
 from iped_mcp.router import get_router
 from iped_mcp.triage import knowledge
-from iped_mcp.triage.identity import _Budget
+from iped_mcp.triage.budget import HttpBudget as _Budget
 
 _SEARCH_HINT = "triage_query_discovery (probe de frase/sonda Regex)"
 _EMPTY_SID_MESSAGE = "'source_id' é obrigatório (veja iped_list_sources)."
