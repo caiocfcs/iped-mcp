@@ -37,13 +37,20 @@ from iped_mcp.whatsapp.queries import (
     PRIVATE_NAME_RE,
     bucket_key,
     build_account_query,
+    build_all_wa_query,
     build_audio_term_query,
+    build_contacts_query,
+    build_conversation_query,
     build_conversation_window_query,
+    build_date_range_query,
+    build_group_query,
     build_marker_query,
     build_media_by_hash,
     build_media_mime_query,
     build_message_term_query,
+    build_messages_query,
     build_pdf_query,
+    build_private_query,
     build_profile_query,
     classify_name,
     display_name,
@@ -59,6 +66,14 @@ TEXT_STATUS_UNAVAILABLE = "unavailable"
 TEXT_CAPPED_MARKER = "[TRUNCADO em {total_bytes} bytes — capped]"
 
 _WA_HINT = "Use whatsapp_reference para conferir os campos e queries canônicas."
+
+# Placeholders de documentação da whatsapp_reference — nunca enviados ao IPED;
+# mostram apenas o formato da query canônica (o valor real entra no lugar).
+_REF_NUMBER_PLACEHOLDER = "<número>"
+_REF_HASH_PLACEHOLDER = "<HASH>"
+_REF_TERM_PLACEHOLDER = "<termo>"
+_REF_DATE_RANGE_BOUNDS = ("A", "B")
+_REF_DATE_RANGE_NOTE = "(superior date-only → T23:59:59Z)"
 
 _NO_WA_RESULT = {
     "has_whatsapp": False,
@@ -351,15 +366,11 @@ def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
     started_at = time.monotonic()
     if top < 1:
         raise ValueError("top deve ser >= 1.")
-    total_wa = len(search_ids("accountType:WhatsApp", source_id, _WA_HINT))
+    total_wa = len(search_ids(build_all_wa_query(), source_id, _WA_HINT))
     if total_wa == 0:
         return {"source": source_id, **_NO_WA_RESULT, **_collect_envelope(started_at, [], 0)}
     total_messages = len(
-        search_ids(
-            'accountType:WhatsApp AND category:"Instant Messages"',
-            source_id,
-            _WA_HINT,
-        )
+        search_ids(build_messages_query(), source_id, _WA_HINT)
     )
     records, _sha_map, dropped = collect_messages(source_id)
     dates = sorted(r.date for r in records if r.date)
@@ -972,86 +983,122 @@ def whatsapp_text_search(source_id: str, term: str, top: int = 10) -> dict[str, 
     }
 
 
+def _reference_canonical_filters() -> dict[str, str]:
+    """Filtros canônicos da referência, gerados pelos builders (fonte única).
+
+    Returns:
+        Mapa nome do filtro → query Lucene exata produzida pelo builder.
+    """
+    date_from, date_to = _REF_DATE_RANGE_BOUNDS
+    return {
+        "all_whatsapp": build_all_wa_query(),
+        "messages": build_messages_query(),
+        "group_messages": build_group_query(),
+        "private_messages": build_private_query(),
+        "private_conversation": build_conversation_query(_REF_NUMBER_PLACEHOLDER),
+        "date_range": (
+            f"{build_date_range_query(date_from, date_to)} "
+            f"{_REF_DATE_RANGE_NOTE}"
+        ),
+        "account": build_account_query(),
+        "contacts": build_contacts_query(),
+        "media_by_hash": build_media_by_hash(_REF_HASH_PLACEHOLDER),
+        "audio_transcription": build_audio_term_query(_REF_TERM_PLACEHOLDER),
+        "pdf_with_text": build_pdf_query(),
+    }
+
+
+def _reference_name_patterns() -> dict[str, str]:
+    """Padrões documentais de `name`; a regex vem do canôn PRIVATE_NAME_RE."""
+    return {
+        "private": "WhatsApp Chat - <contato> - <número>_message_<n> (iPhone: <número>_0_message_<n>; Android sem nome: WhatsApp Chat - <número>_message_<n>)",
+        "group": "WhatsApp Group - <grupo> - <jid>_message_<n> (Android: <jid>_0_message_<n>)",
+        "channel": "WhatsApp Channel - <nome> - <jid>_message_<n>",
+        "status": "WhatsApp Status - <nome> - <número>_message_<n> (só iPhone)",
+        "account": "WhatsApp Account: <nome>",
+        "contact": "WhatsApp Contact: <nome>",
+            "private_key_regex": PRIVATE_NAME_RE.pattern,
+    }
+
+
+def _reference_type_markers() -> dict[str, str]:
+    """Marcadores de tipo via builders de marcador/mime (validados em F1 D1.4).
+
+    Returns:
+        Mapa tipo → query exata do marcador, mais a nota de uso de `mediaMime`.
+    """
+    return {
+        "audio": build_marker_query("audio"),
+        "image": build_marker_query("image"),
+        "video": build_marker_query("video"),
+        "pdf": build_media_mime_query("application/pdf"),
+        "note": (
+            "mediaMime só com valor exato (sem wildcard) e é multi-valorado "
+            "(jpeg=webp=png — não somar)."
+        ),
+    }
+
+
+def _reference_pitfalls() -> dict[str, str]:
+    """Armadilhas documentadas (F1/F2/F3) — conteúdo estático de referência."""
+    return {
+        "F1.1": "campo com ':' no nome sem escape (Communication:From, audio:transcription, ufed:SHA256) → HTTP 500; usar Communication\\:From etc.",
+        "F1.2": "name é tokenizado: name:WhatsApp*message* → 0; usar tokens exatos (name:Chat AND name:<número>).",
+        "F1.3": "isGroupMessage só existe quando true: isGroupMessage:false → 0.",
+        "F1.4": "Communication:To:Group não é confiável p/ grupo (ex.: 1.489 vs 6.055 do isGroupMessage:true).",
+        "F1.5": "mediaMime sem wildcard: mediaMime:image/* → 0; usar valor exato (mediaMime:image/jpeg).",
+        "F1.6": "transcrição de áudio fica no doc de mídia (audio:transcription), não na mensagem.",
+        "F1.7": "accountType:WhatsApp inclui não-mensagens (conta, contatos, status, chamadas).",
+        "F1.8": "volume alto (10⁴–10⁵ docs): contagem + amostra, nunca a lista cheia.",
+        "F1.9": "negação Lucene: X -Y AND Z descarta X; usar X AND -Y AND Z, (X -Y) AND Z ou NOT Y.",
+        "F1.10": "@ em valor sem aspas → HTTP 500; usar prefixo numérico (Name:<número>*).",
+        "F1.11": "contentType sem aspas → misparse (1.499.455 docs); valor entre aspas.",
+        "F1.12": "name:WhatsApp é superset (+imagens de perfil, pastas, logs).",
+        "F1.13": "mediaMime multi-valorado (jpeg=webp=png) — não somar.",
+        "F1.14": "contentType não é filtro confiável de mensagem (message/x-whatsapp-message < IM).",
+        "F1.15": "nome de grupo Android com segmento extra: <jid>_0_message_<n>.",
+        "F1.16": "PDF Android não tem linkedItems (sem link mensagem→mídia).",
+        "F1.17": "link mensagem→mídia é unidirecional (linkedItems sha-256 → ufed\\:SHA256).",
+        "F1.18": "min/max por amostra não é o real; usar coleta completa ou busca binária.",
+        "F2.1": "WhatsApp Channels: isGroupMessage:true INCLUI canais; separar grupo×canal só pelo prefixo do name.",
+        "F2.2": "chat privado iPhone com segmento extra _N: <número>_0_message_<n>.",
+        "F2.3": "chat privado Android sem nome: WhatsApp Chat - <número>_message_<n>.",
+        "F2.4": "From/To em 4 formatos (Nome (número) · Nome (JID) · JID puro · ausente).",
+        "F2.5": "msg de grupo sem isGroupMessage (eventos de sistema): contagem por flag subconta; usar name-based.",
+        "F2.6": "range de data date-only no fim trunca o último dia; usar T23:59:59Z.",
+        "F2.7": "@ em valor da query → HTTP 500; usar prefixo numérico Name:<número>*.",
+        "F2.8": "isGroupMessage:true também em chamadas de grupo e 1 contato (só Android); p/ msgs: IM AND isGroupMessage:true.",
+        "F2.9": "artefato WhatsApp Chat - 0_message_N (ex.: 4 docs From:'0'); excluir da contagem real.",
+        "F2.10": "self-chat do dono (Mensagens salvas): entra nas conversas privadas, não vira interlocutor.",
+        "F2.11": "name:<número> casa Status/Chamadas (+1/+poucos); usar name:Chat AND name:<número>.",
+        "F3.1": "doc_text não é buscável via /search; texto de anexo só iterando /text nos PDFs.",
+        "F3.2": "filtro privado bruto inclui eventos de grupo/canal sem a flag; refinar por name prefix WhatsApp Chat - .",
+        "F3.3": "token Lucene ≠ substring (Message-Body:pix ≠ pixeado); a query Lucene é a canônica.",
+        "F3.4": "PDF vazio (size=0) tem /text vazio; filtrar size:[1 TO *].",
+        "F3.5": "imagem tem /text vazio (só quebras de linha); attachment_text só útil p/ PDF/documento.",
+        "F3.6": "name:<número> casa Status; usar name:Chat AND name:<número> p/ conversa privada exata.",
+    }
+
+
 def whatsapp_reference() -> dict[str, Any]:
     """Referência validada de campos, padrões de name, marcadores de tipo e queries canônicas do WhatsApp no IPED, com as armadilhas conhecidas.
 
     Use em dúvida sobre um campo ou query antes de montar buscas livres
-    (iped_search). Sem chamada ao IPED (conteúdo estático, derivado dos
-    testes validados das Fases 1–3).
+    (iped_search). Sem chamada ao IPED: as queries são geradas pelos builders
+    canônicos de `iped_mcp.whatsapp.queries` (fonte única); o restante é
+    conteúdo estático derivado dos testes validados das Fases 1–3.
     """
     return {
-        "canonical_filters": {
-            "all_whatsapp": "accountType:WhatsApp",
-            "messages": 'accountType:WhatsApp AND category:"Instant Messages"',
-            "group_messages": "isGroupMessage:true",
-            "private_messages": 'accountType:WhatsApp AND category:"Instant Messages" AND -isGroupMessage:true',
-            "private_conversation": 'accountType:WhatsApp AND category:"Instant Messages" AND -isGroupMessage:true AND name:Chat AND name:<número>',
-            "date_range": "Communication\\:Date:[A TO B] (superior date-only → T23:59:59Z)",
-            "account": 'contentType:"application/x-whatsapp-account"',
-            "contacts": "accountType:WhatsApp AND name:Contact",
-            "media_by_hash": "ufed\\:SHA256:<HASH>",
-            "audio_transcription": "audio\\:transcription:<termo>",
-            "pdf_with_text": 'category:"PDF Documents" AND size:[1 TO *]',
-        },
-        "name_patterns": {
-            "private": "WhatsApp Chat - <contato> - <número>_message_<n> (iPhone: <número>_0_message_<n>; Android sem nome: WhatsApp Chat - <número>_message_<n>)",
-            "group": "WhatsApp Group - <grupo> - <jid>_message_<n> (Android: <jid>_0_message_<n>)",
-            "channel": "WhatsApp Channel - <nome> - <jid>_message_<n>",
-            "status": "WhatsApp Status - <nome> - <número>_message_<n> (só iPhone)",
-            "account": "WhatsApp Account: <nome>",
-            "contact": "WhatsApp Contact: <nome>",
-            "private_key_regex": r"^WhatsApp Chat - (?:.+ - )?(\d+)(?:_\d+)?_message_\d+$",
-        },
-        "type_markers": {
-            "audio": 'Message-Body:"! AUDIO_MESSAGE"',
-            "image": 'Message-Body:"! IMAGE_MESSAGE"',
-            "video": 'Message-Body:"! VIDEO_MESSAGE"',
-            "pdf": "mediaMime:application/pdf",
-            "note": "mediaMime só com valor exato (sem wildcard) e é multi-valorado (jpeg=webp=png — não somar).",
-        },
+        "canonical_filters": _reference_canonical_filters(),
+        "name_patterns": _reference_name_patterns(),
+        "type_markers": _reference_type_markers(),
         "from_to_formats": [
             "Nome (5511999999999)",
             "Nome (5511999999999@s.whatsapp.net)",
             "5511999999999@s.whatsapp.net (JID puro)",
             "ausente (eventos de sistema)",
         ],
-        "pitfalls": {
-            "F1.1": "campo com ':' no nome sem escape (Communication:From, audio:transcription, ufed:SHA256) → HTTP 500; usar Communication\\:From etc.",
-            "F1.2": "name é tokenizado: name:WhatsApp*message* → 0; usar tokens exatos (name:Chat AND name:<número>).",
-            "F1.3": "isGroupMessage só existe quando true: isGroupMessage:false → 0.",
-            "F1.4": "Communication:To:Group não é confiável p/ grupo (ex.: 1.489 vs 6.055 do isGroupMessage:true).",
-            "F1.5": "mediaMime sem wildcard: mediaMime:image/* → 0; usar valor exato (mediaMime:image/jpeg).",
-            "F1.6": "transcrição de áudio fica no doc de mídia (audio:transcription), não na mensagem.",
-            "F1.7": "accountType:WhatsApp inclui não-mensagens (conta, contatos, status, chamadas).",
-            "F1.8": "volume alto (10⁴–10⁵ docs): contagem + amostra, nunca a lista cheia.",
-            "F1.9": "negação Lucene: X -Y AND Z descarta X; usar X AND -Y AND Z, (X -Y) AND Z ou NOT Y.",
-            "F1.10": "@ em valor sem aspas → HTTP 500; usar prefixo numérico (Name:<número>*).",
-            "F1.11": "contentType sem aspas → misparse (1.499.455 docs); valor entre aspas.",
-            "F1.12": "name:WhatsApp é superset (+imagens de perfil, pastas, logs).",
-            "F1.13": "mediaMime multi-valorado (jpeg=webp=png) — não somar.",
-            "F1.14": "contentType não é filtro confiável de mensagem (message/x-whatsapp-message < IM).",
-            "F1.15": "nome de grupo Android com segmento extra: <jid>_0_message_<n>.",
-            "F1.16": "PDF Android não tem linkedItems (sem link mensagem→mídia).",
-            "F1.17": "link mensagem→mídia é unidirecional (linkedItems sha-256 → ufed\\:SHA256).",
-            "F1.18": "min/max por amostra não é o real; usar coleta completa ou busca binária.",
-            "F2.1": "WhatsApp Channels: isGroupMessage:true INCLUI canais; separar grupo×canal só pelo prefixo do name.",
-            "F2.2": "chat privado iPhone com segmento extra _N: <número>_0_message_<n>.",
-            "F2.3": "chat privado Android sem nome: WhatsApp Chat - <número>_message_<n>.",
-            "F2.4": "From/To em 4 formatos (Nome (número) · Nome (JID) · JID puro · ausente).",
-            "F2.5": "msg de grupo sem isGroupMessage (eventos de sistema): contagem por flag subconta; usar name-based.",
-            "F2.6": "range de data date-only no fim trunca o último dia; usar T23:59:59Z.",
-            "F2.7": "@ em valor da query → HTTP 500; usar prefixo numérico Name:<número>*.",
-            "F2.8": "isGroupMessage:true também em chamadas de grupo e 1 contato (só Android); p/ msgs: IM AND isGroupMessage:true.",
-            "F2.9": "artefato WhatsApp Chat - 0_message_N (ex.: 4 docs From:'0'); excluir da contagem real.",
-            "F2.10": "self-chat do dono (Mensagens salvas): entra nas conversas privadas, não vira interlocutor.",
-            "F2.11": "name:<número> casa Status/Chamadas (+1/+poucos); usar name:Chat AND name:<número>.",
-            "F3.1": "doc_text não é buscável via /search; texto de anexo só iterando /text nos PDFs.",
-            "F3.2": "filtro privado bruto inclui eventos de grupo/canal sem a flag; refinar por name prefix WhatsApp Chat - .",
-            "F3.3": "token Lucene ≠ substring (Message-Body:pix ≠ pixeado); a query Lucene é a canônica.",
-            "F3.4": "PDF vazio (size=0) tem /text vazio; filtrar size:[1 TO *].",
-            "F3.5": "imagem tem /text vazio (só quebras de linha); attachment_text só útil p/ PDF/documento.",
-            "F3.6": "name:<número> casa Status; usar name:Chat AND name:<número> p/ conversa privada exata.",
-        },
+        "pitfalls": _reference_pitfalls(),
     }
 
 
