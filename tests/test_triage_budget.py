@@ -18,8 +18,12 @@ from typing import Any
 import pytest
 
 from iped_mcp import progress
-from iped_mcp.triage import budget, identity, knowledge, telephony, transcripts
+from iped_mcp.triage import (
+    budget, financial, geolocation, identity, knowledge, telephony, transcripts,
+)
 from tests.conftest import SOURCE_ID, make_doc
+import tests.test_triage_financial as tf
+import tests.test_triage_geolocation as tg
 import tests.test_triage_telephony as t1
 import tests.test_triage_transcripts as t2
 
@@ -211,3 +215,48 @@ def test_t2_orcamento_estourado_vira_parcial_marcado(
     assert any("http_budget_exceeded" in w and "cap 3" in w for w in out["warnings"])
     assert out["with_transcript"] == 2  # parcial NÃO vazio
 
+
+# --- R-TRIAGE-4: docs_omitted_by_budget com omissão >= 2 -----------------------
+
+
+def test_t5_docs_omitidos_maiores_que_1_sao_contados_por_valor(
+    webapi: Any, fake_router: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cap 8 = 6 probes + 2 docs p/ 3 candidatos: omissão EXATA de 1.
+
+    R-TRIAGE-4 (geolocation.py:388): publicava ``len(docs_omitted)``
+    contra o contrato de elemento único — com 2+ docs omitidos diria 2,
+    3..., enquanto a quantidade real vive em ``docs_omitted[0]``. O pino
+    antigo (cap 7) só exercitava omissão 1, onde len() e [0] coincidem por
+    acaso; aqui a conta sai do CONTRATO, e um valor via ``len()`` é
+    indistinguível só nesse caso degenerado — o par do financial (2
+    omitidos) discrimina de vez.
+    """
+    monkeypatch.setitem(knowledge.TOOL_BUDGETS, "triage_geolocation", 8)
+    tg._cluster(webapi, 900, 3, "-22.9", "-43.2")
+
+    out = geolocation.triage_geolocation(SOURCE_ID)
+
+    assert out["truncated"]["http_budget_exceeded"] is True
+    assert out["counters"]["http_calls"] == 8
+    assert out["truncated"]["docs_omitted_by_budget"] == 1
+
+
+def test_t4_docs_omitidos_maiores_que_1_sao_contados_por_valor(
+    webapi: Any, fake_router: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cap 23 = 22 buscas + 1 doc p/ 3 evidências: omissão EXATA de 2.
+
+    R-TRIAGE-4 (financial.py:765) no caso que DISCRIMINA: com ``len()`` a
+    envelope diria 1 enquanto o contrato carrega a quantidade 2 em
+    ``docs_omitted[0]`` — a omissão real é 3 candidatos − 1 slot = 2.
+    """
+    monkeypatch.setitem(knowledge.TOOL_BUDGETS, "triage_financial", 23)
+    for i in range(3):
+        tf._money(webapi, 400 + i, f"c{i}.pdf", [f"R$ {i + 1},00"])
+
+    out = financial.triage_financial(SOURCE_ID)
+
+    assert out["truncated"]["http_budget_exceeded"] is True
+    assert out["counters"]["http_calls"] == 23
+    assert out["truncated"]["docs_omitted_by_budget"] == 2

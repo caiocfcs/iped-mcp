@@ -762,7 +762,11 @@ def _truncated_payload(
         "accounts_omitted": max(len(accounts) - knowledge.FINANCIAL_LIST_TOP, 0),
         "http_budget_exceeded": budget.exceeded,
         "http_budget_calls_at_stop": budget.used if budget.exceeded else None,
-        "docs_omitted_by_budget": len(docs_omitted),
+        # docs_omitted carrega a QUANTIDADE num único elemento
+        # (contrato fetch_within_budget: omitted[0]) — por isso sum(),
+        # não len(): com 2+ docs omitidos len() subestimava a omissão
+        # (R-TRIAGE-4; padrão já correto em media.py/devices_networks.py).
+        "docs_omitted_by_budget": sum(docs_omitted),
     }
 
 
