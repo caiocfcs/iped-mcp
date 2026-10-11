@@ -166,7 +166,10 @@ class FakeWebAPI:
         if "Regex:EMAIL" in q:
             return [DOC_NO_IMAGE_ID]
         if q == "*":
-            return list(ALL_DOC_IDS)
+            # Match-all reflete o catalogo atual de docs do SOURCE_ID (M-7:
+            # testes adicionam docs p/ amostragem; com o catalogo padrao o
+            # resultado e identico a ALL_DOC_IDS, mesma ordem).
+            return [i for (src, i) in self.docs if src == SOURCE_ID]
         return []
 
     def add_bookmark(self, name: str) -> None:
