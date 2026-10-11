@@ -980,3 +980,115 @@ DN_EMPTY_MESSAGE = (
     "nenhum registro de rede/dispositivo aproveitável (logs Service/IP, "
     "SSIDs ou nomes bluetooth) neste source"
 )
+
+# --- T-8 comunicação: gate, queries compartilhadas e pontuação (DESIGN 09-B §8) ---
+
+# Categorias do eixo comunicação no ICARO (gate interno por SUBSTRING —
+# o query do MCP usa a forma exata category:"X"; cobertura WA vem dos
+# builders canônicos, §8.0). Origem: communication_strategy.py:241-245.
+COMMUNICATION_CATEGORIES = (
+    "chats",
+    "messages",
+    "whatsapp",
+    "telegram",
+    "sms",
+    "emails",
+    "mensagens instantâneas",
+    "web history",
+    "navegação",
+    "browser history",
+    "logs",
+    "histórico de navegação",
+)
+
+# Fontes que viram histórico de busca (ufed:Source minúsculo, :689). O gate
+# de aceite do item é categoria válida OU source nesta lista (:252-257).
+# Origem: communication_strategy.py:20-24 (WEB_BROWSERS, cópia fiel).
+COMMUNICATION_BROWSERS = frozenset({
+    "safari", "chrome", "edge", "firefox", "opera", "browser",
+    "samsung internet browser", "gmail", "play store", "google maps",
+    "google search", "youtube",
+})
+
+# Marcador de source dos logs de interação (comparação EXATA, case-sensitive
+# como no ICARO :695; o parse do corpo é o mesmo regex :408).
+COMMUNICATION_INTERACTION_SOURCE = "interactionc"
+
+# Regex do corpo InteractionC: "participent identifier:" é o literal
+# datilografado do ICARO (sic, :408) — preservado byte a byte.
+COMMUNICATION_INTERACTION_BODY_RE = (
+    r"participent identifier:\s*([^\s]+)(?:\s+from\s+(.*))?"
+)
+
+# Communication:To "Nome (+55...)": nome e telefone do destinatário.
+# Origem: communication_strategy.py:475.
+COMMUNICATION_TO_RE = r"(.*?)\((\+?\d+)"
+
+# E-mail entre <...> no nome de exibição. Origem: :515.
+COMMUNICATION_EMAIL_ANGLE_RE = r"<(.*?)>"
+
+# Cap de varredura do eixo (§8.4): o design fixa CHAT_SCAN_CAP = 2500
+# reutilizando o valor de CATEGORY_QUERY_CAP (base_strategy.py:59).
+CHAT_SCAN_CAP = CATEGORY_QUERY_CAP
+
+# Constantes de pontuação do achado de chat (handler
+# _finding_from_communication, draft_report_iped_manager.py:866-869):
+#   total = max(chat_total_messages, message_count)                      :866
+#   com termos:    score = min(50 + total, 95)                           :868
+#   sem termos:    score = min(40 + total // 2, 70)                      :868
+#   relevância: ALTA com termos; senão MÉDIA se total > 50 (ESTREITO);
+#               senão BAIXA                                              :869
+COMM_SCORE_TERM_BASE = 50
+COMM_SCORE_TERM_CAP = 95
+COMM_SCORE_NOTERM_BASE = 40
+COMM_SCORE_NOTERM_DIV = 2
+COMM_SCORE_NOTERM_CAP = 70
+CHAT_RELEVANCE_MEDIA_MIN = 50
+
+# Histórico de busca (_finding_from_search_history, draft_report:950-960):
+# score 40 fixo, relevância BAIXA, entidade "{app}: {query[:50]}".
+SCORE_SEARCH_HISTORY = 40
+COMM_QUERY_TRUNC_CHARS = 50        # draft_report:953
+SEARCH_HISTORY_MAX = 50            # strategy :742-743 (sort desc + [:50])
+
+# Visões do envelope (§8.6): grupos sempre mantidos; indivíduos no top-20
+# por interações (política strategy :732-741) e a visão final [:30].
+CHAT_INDIVIDUALS_TOP = 20
+CHATS_VIEW_MAX = 30
+
+# Campos lidos pelo eixo (fontes no strategy).
+COMMUNICATION_MESSAGES_COUNT_FIELD = "Conversation:messagesCount"   # :440
+COMMUNICATION_TO_FIELD = "Communication:To"                         # :470
+COMMUNICATION_CHAT_ID_FIELD = "ufed:ChatId"                         # :486
+COMMUNICATION_BODY_FIELD = "ufed:Body"                              # :500/:694
+COMMUNICATION_TIMESTAMP_FIELD = "ufed:TimeStamp"                    # :686
+# Flag de grupo: isGroupMessage primeiro, ufed:IsGroupMessage como
+# fallback; só "true" (lowercase) casa. Origem: :700-701.
+COMMUNICATION_GROUP_FLAG_FIELDS = ("isGroupMessage", "ufed:IsGroupMessage")
+# Identificadores do dono (veto de autointerlocutor).
+# Origem: communication_strategy.py:304-315.
+COMMUNICATION_OWNER_FIELDS = (
+    "Conversation:PhoneOwner:name",
+    "Conversation:PhoneOwner:phoneNumber",
+    "Conversation:PhoneOwner:id",
+)
+# Rótulos de fallback do nome normalizado (:519-520); o rótulo de grupo
+# desconhecido fica FORA da contagem de grupos (:735-736).
+COMMUNICATION_UNKNOWN_LABEL = "DESCONHECIDO"
+COMMUNICATION_UNKNOWN_GROUP_LABEL = "GRUPO DESCONHECIDO"
+# Fallback do timestamp de busca. Origem: :686.
+COMMUNICATION_TIMESTAMP_FALLBACK = "N/I"
+
+# Agregador "agregada-v1" (D-9): sem mescla por chat-id legacy/current
+# (strategy :427-660) — warning sempre que houver chat.
+COMMUNICATION_AGG_WARNING = (
+    "agregacao=agregada-v1: chats agregados por chave visível (nome do "
+    "contato WA ou destinatário da mensagem); a mescla por chat-id "
+    "legacy/current do ICARO (communication_strategy:427-660) não é portada"
+)
+
+# Eixo sem nada aproveitável: vazio explícito com mensagem (§0.1).
+COMMUNICATION_EMPTY_MESSAGE = (
+    "nenhum chat, log de interação ou histórico de busca aproveitável "
+    "neste source"
+)

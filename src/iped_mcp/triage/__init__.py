@@ -8,6 +8,7 @@ LLM e nenhum acesso a arquivos do caso.
 
 from fastmcp import FastMCP
 
+from iped_mcp.triage.communication import register as register_communication
 from iped_mcp.triage.financial import register as register_financial
 from iped_mcp.triage.geolocation import register as register_geolocation
 from iped_mcp.triage.devices_networks import register as register_devices_networks
@@ -26,6 +27,7 @@ def register(mcp: FastMCP) -> None:
     Returns:
         Nada.
     """
+    register_communication(mcp)
     register_financial(mcp)
     register_geolocation(mcp)
     register_identity(mcp)
