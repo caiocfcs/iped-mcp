@@ -16,6 +16,11 @@ instância. O teto de tempo de uma chamada é
 Timeouts são por classe de operação (DESIGN 04 / M-4): busca, props,
 texto e download têm teto próprio, definido em `iped_mcp.config` e
 ajustável por env (`IPED_MCP_TIMEOUT_*`) sem tocar código.
+
+No `/text`, o HTTP 500 do jar-alvo é o contrato de "documento sem texto
+extraído" (WONT_FIX permanente do fork, P2-5): `get_document_text` o
+traduz em ESTADO (`TextResult.status = no_text`), não em exceção
+(DESIGN 08 / M-8 — padrão do icaro, iped_client.py:233-244).
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 from urllib.parse import quote
 
 import requests
@@ -36,6 +41,7 @@ from iped_mcp.errors import (
     IpedError,
     IpedHTTPError,
     IpedResponseError,
+    ServerError,
     error_for_response,
     response_not_readable_message,
     server_unavailable_text,
@@ -48,15 +54,42 @@ logger = logging.getLogger("iped_mcp.client")
 load_dotenv()
 
 DEFAULT_IPED_URL = os.environ.get("IPED_URL", "http://localhost:1234")
-# Teto de leitura do /text (chunked, sem Content-Length): evita estourar memória
-# em docs com texto extraído gigante. Acima disso, capped=True.
-_TEXT_READ_CAP = 10 * 1024 * 1024  # 10 MB
 # Pool de conexões casado com o paralelismo de fetch (config.WORKERS): com o
 # pool padrão (10), workers > 10 descartam conexões ("pool is full") e parte
 # dos requests paga um novo handshake TCP. +8 de folga p/ buscas concorrentes.
 _POOL_SIZE = config.WORKERS + 8
 # Tamanho do chunk de leitura do /text (iter_content).
 _TEXT_CHUNK_SIZE = 65536
+
+# Estados do /text devolvidos como DADO (DESIGN 08 / M-8). No jar-alvo o
+# HTTP 500 marca "documento sem texto extraído" — WONT_FIX permanente do
+# fork (P2-5, /iped-research/BACKLOG.md:33-34); o MCP traduz o 500 desta
+# rota em estado, como o icaro já faz (iped_client.py:233-244).
+TEXT_STATUS_OK = "ok"
+TEXT_STATUS_NO_TEXT = "no_text"
+
+
+class TextResult(NamedTuple):
+    """Resultado de uma leitura de /text — status como dado (DESIGN 08 / M-8).
+
+    Os três primeiros campos preservam o contrato ``tuple[str, int, bool]``
+    legado (``text, total_chars, capped``) para os consumidores que já
+    destravam/de indexam o trio (ex.: ``fetch.get_document_text``); o
+    estado viaja no quarto campo.
+
+    Attributes:
+        text: texto lido (vazio quando ``status`` é ``no_text``).
+        total_chars: caracteres decodificados (piso quando ``capped``).
+        capped: a leitura parou no teto de bytes.
+        status: ``TEXT_STATUS_OK`` ou ``TEXT_STATUS_NO_TEXT``.
+        total_bytes: bytes lidos do stream (piso quando ``capped``).
+    """
+
+    text: str
+    total_chars: int
+    capped: bool
+    status: str = TEXT_STATUS_OK
+    total_bytes: int = 0
 
 
 class IPEDClient:
@@ -583,31 +616,66 @@ class IPEDClient:
         return filename, resp
 
     def get_document_text(
-        self, source_id: str, doc_id: int, max_bytes: int = _TEXT_READ_CAP
-    ) -> tuple[str, int, bool]:
-        """→ (text, total_chars, capped). Texto extraído do doc (endpoint /text).
+        self, source_id: str, doc_id: int, max_bytes: int | None = None
+    ) -> TextResult:
+        """Texto extraído do doc (endpoint /text) como estado, não exceção.
 
-        O stream é chunked (sem Content-Length): lê até max_bytes para contar o
-        total. capped=True → total_chars é piso (o texto real é maior).
+        Status como dado (DESIGN 08 / M-8): no jar-alvo, doc sem texto
+        extraído responde HTTP 500 — WONT_FIX permanente do fork (P2-5).
+        Este cliente traduz o 500 desta rota em ``status=no_text`` (sem
+        exceção); por isso o 500 de /text também não é re-tentado
+        (``retry_server_errors=False`` — estado determinístico, mesmo
+        raciocínio do `search` no M-3/AC4). O cap de leitura é
+        ``config.TEXT_CAP_BYTES`` (env ``IPED_MCP_TEXT_CAP``, default 10 MB).
+
+        O stream é chunked (sem Content-Length): lê até ``max_bytes`` para
+        contar o total. ``capped=True`` → ``total_chars``/``total_bytes``
+        são piso (o texto real é maior).
 
         Args:
             source_id: source do doc.
             doc_id: id do doc.
-            max_bytes: teto de leitura em bytes (padrão 10 MB).
+            max_bytes: teto de leitura em bytes; None = ``config.TEXT_CAP_BYTES``
+                (resolvido na chamada, respeita reload do config).
 
         Returns:
-            (texto, nº de caracteres lidos, texto truncado no teto).
+            ``TextResult`` com texto, estado (``ok``/``no_text``) e o flag
+            ``capped`` — presente em TODA resposta bem-sucedida.
 
         Raises:
-            IpedError: falha de rede/HTTP (500 de doc inexistente incluído).
+            ResourceNotFoundError: HTTP 404 (policy M-2 intacta; ex.: source
+                inexistente).
+            IpedError: falha de rede/timeout/HTTP exceto o 500 desta rota.
         """
-        resp = self._request(
-            "GET",
-            f"sources/{source_id}/docs/{doc_id}/text",
-            timeout=self._text_timeout,
-            source_id=source_id,
-            doc_id=doc_id,
-        )
+        cap = config.TEXT_CAP_BYTES if max_bytes is None else max_bytes
+        try:
+            resp = self._request(
+                "GET",
+                f"sources/{source_id}/docs/{doc_id}/text",
+                timeout=self._text_timeout,
+                source_id=source_id,
+                doc_id=doc_id,
+                retry_server_errors=False,
+            )
+        except ServerError as exc:
+            # Gancho .response do M-2: o corpo do 500 fica disponível para
+            # diagnóstico (TO_VERIFY: 500-sem-texto × 500-erro-interno são
+            # indistinguíveis no contrato do fork — aceito, P2-5).
+            body = exc.response.text[:200] if exc.response is not None else ""
+            logger.debug(
+                "/text %s/%s: HTTP %s → status no_text (corpo: %r)",
+                source_id,
+                doc_id,
+                exc.status_code,
+                body,
+            )
+            return TextResult(
+                text="",
+                total_chars=0,
+                capped=False,
+                status=TEXT_STATUS_NO_TEXT,
+                total_bytes=0,
+            )
         chunks: list[bytes] = []
         total = 0
         capped = False
@@ -616,11 +684,17 @@ class IPEDClient:
                 continue
             chunks.append(chunk)
             total += len(chunk)
-            if total >= max_bytes:
+            if total >= cap:
                 capped = True
                 break
         text = b"".join(chunks).decode("utf-8", errors="replace")
-        return text, len(text), capped
+        return TextResult(
+            text=text,
+            total_chars=len(text),
+            capped=capped,
+            status=TEXT_STATUS_OK,
+            total_bytes=total,
+        )
 
     def get_document_thumb(self, source_id: str, doc_id: int) -> requests.Response:
         """→ Response bruto da thumbnail (JPEG). Body vazio = doc sem imagem.

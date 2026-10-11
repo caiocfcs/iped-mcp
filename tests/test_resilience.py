@@ -450,12 +450,31 @@ class TestFetchDelegaResiliencia:
         assert fetch.get_document_props(SOURCE_ID, MISSING_DOC_ID) is None
         assert len(session.calls) == 3  # política do client; fetch single-shot
 
-    def test_texto_falha_permanente_vira_none_sem_envenenar_cache(
+    def test_texto_falha_de_conexao_vira_none_sem_envenenar_cache(
         self, fake_router: Any, webapi: Any
     ) -> None:
-        session = FakeSession([make_response(500)] * 3)
+        """M-8: continua None apenas a FALHA de verdade (rede); cache limpo.
+
+        Rede é transitória: o retry do M-3 continua valendo (3 tentativas,
+        sleeper injetado); o estado no_text é só para o 500 do jar."""
+        session = FakeSession([requests.ConnectionError("offline")] * 3)
         fake_router._clients["default"] = IPEDClient(
-            webapi.base_url, session=session
+            webapi.base_url, session=session, sleeper=lambda _s: None
         )
         assert fetch.get_document_text_cached(SOURCE_ID, MISSING_DOC_ID) is None
         assert fetch.text_cache_get(SOURCE_ID, MISSING_DOC_ID) is None
+        assert len(session.calls) == 3  # retry de conexão preservado (M-3)
+
+    def test_texto_500_vira_dado_uma_sochamada_e_cacheavel(
+        self, fake_router: Any, webapi: Any
+    ) -> None:
+        """M-8: 500 de /text e estado (no_text), 1 chamada (rota deterministica)
+        e entra no cache — o contrato WONT_FIX P2-5 nao e mais 'falha'."""
+        session = FakeSession([make_response(500)])
+        fake_router._clients["default"] = IPEDClient(
+            webapi.base_url, session=session
+        )
+        result = fetch.get_document_text_cached(SOURCE_ID, MISSING_DOC_ID)
+        assert result is not None and result.status == "no_text"
+        assert len(session.calls) == 1  # retry_server_errors=False em /text
+        assert fetch.text_cache_get(SOURCE_ID, MISSING_DOC_ID) is result

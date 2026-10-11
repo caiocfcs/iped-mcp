@@ -59,6 +59,30 @@ def _positive_seconds(env_name: str, default: float) -> float:
     return value
 
 
+def _positive_int(env_name: str, default: int) -> int:
+    """Le um limite inteiro do ambiente, validando como valor estritamente positivo.
+
+    Args:
+        env_name: Nome da variavel de ambiente (ex.: ``IPED_MCP_TEXT_CAP``).
+        default: Valor inteiro usado quando a variavel nao esta no ambiente.
+
+    Returns:
+        O valor efetivo (``> 0``).
+
+    Raises:
+        ValueError: Valor nao inteiro ou ``<= 0`` (cap zero/negativo truncaria
+            toda leitura a nada sem diagnostico).
+    """
+    raw = os.environ.get(env_name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} deve ser um n inteiro de bytes: {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{env_name} deve ser > 0: {raw!r}")
+    return value
+
+
 # --- Timeouts por classe de operação (DESIGN 04 / M-4) -------------------------
 # Substituem o timeout único de 10 s do baseline, que abortava cedo demais as
 # operações longas reais (D-17/G8). Fonte única: lidos 1× aqui, override por env
@@ -83,3 +107,12 @@ TIMEOUT_CONNECT_DOWNLOAD = _positive_seconds("IPED_MCP_TIMEOUT_CONNECT_DOWNLOAD"
 # Download — componente read: 120 s, arquivo grande exfiltrado em conexão
 # lenta; era o teto do baseline (_CONTENT_READ_TIMEOUT), preservado.
 TIMEOUT_READ_DOWNLOAD = _positive_seconds("IPED_MCP_TIMEOUT_READ_DOWNLOAD", 120.0)
+
+
+# --- Teto de leitura do /text (DESIGN 08 / M-8) ---------------------------------
+# O /text do jar-alvo e chunked e sem Content-Length: sem teto, um doc com texto
+# extraido gigante estouraria a memoria do servidor MCP. O valor era o literal
+# _TEXT_READ_CAP (10 MB) no client; vira constante com env ``IPED_MCP_TEXT_CAP``
+# para o operador ajustar por caso sem tocar codigo. Default PRESERVADO (AC2):
+# os 10 MB originais.
+TEXT_CAP_BYTES = _positive_int("IPED_MCP_TEXT_CAP", 10 * 1024 * 1024)

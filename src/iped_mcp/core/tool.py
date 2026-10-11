@@ -18,6 +18,7 @@ from typing import Any
 import requests
 from fastmcp import FastMCP
 
+from iped_mcp.client import TEXT_STATUS_NO_TEXT, TEXT_STATUS_OK, TextResult
 from iped_mcp.diagnose import guarded_call
 from iped_mcp.download import resolve_filename
 from iped_mcp.fetch import text_cache_get, text_cache_set
@@ -291,8 +292,13 @@ def doc_text(
 
     O endpoint /text pode devolver texto gigante (centenas de KB num doc só),
     então a tool devolve no máximo `max_chars` caracteres a partir de `offset`.
-    Use `next_offset` do retorno para ler o próximo pedaço. Doc sem texto
-    extraível → no_text=true (binário: use iped_doc_export).
+    Use `next_offset` do retorno para ler o próximo pedaço.
+
+    Estados (DESIGN 08 / M-8 — status como dado, nunca exceção):
+    `status="ok"` com `text`; ou `status="no_text"` (+ `no_text=true`)
+    quando o IPED não devolve texto (HTTP 500 do fork — doc binário: use
+    iped_doc_export) ou devolve corpo vazio. `capped=true` marca texto
+    truncado no teto de leitura do cliente (`IPED_MCP_TEXT_CAP`, 10 MB).
 
     Args:
         source_id: source no IPED (veja iped_list_sources).
@@ -304,52 +310,101 @@ def doc_text(
         raise ValueError("max_chars deve estar entre 1 e 100000.")
     if offset < 0:
         raise ValueError("offset deve ser >= 0.")
-    cached = text_cache_get(source_id, doc_id)
-    if cached is not None:
-        text, total_chars, capped = cached
-    else:
-        # guarded_call preserva o diagnóstico de erro (500 → ValueError); o cache
-        # só armazena resultados bem-sucedidos.
+    read = text_cache_get(source_id, doc_id)
+    if read is None:
+        # guarded_call continua traduzindo falhas reais (rede, 404, rede
+        # viva com erro); o 500 de "sem texto" já chega como estado
+        # no_text do cliente e o cache também o armazena (barato re-usar).
         client = get_router()
-        text, total_chars, capped = guarded_call(
+        read = guarded_call(
             client.get_document_text,
             f"GET /sources/{source_id}/docs/{doc_id}/text",
             _DOC_HINT,
             source_id,
             doc_id,
         )
-        text_cache_set(source_id, doc_id, (text, total_chars, capped))
-    if not text.strip():
-        return {
-            "source": source_id,
-            "doc_id": doc_id,
-            "no_text": True,
-            "note": "doc sem texto extraível; use iped_doc_export para o arquivo bruto.",
-        }
-    segment = text[offset : offset + max_chars]
+        text_cache_set(source_id, doc_id, read)
+    if read.status == TEXT_STATUS_NO_TEXT:
+        return _doc_text_no_text(
+            source_id,
+            doc_id,
+            "doc sem texto extraível (o IPED não devolve texto p/ este doc); "
+            "use iped_doc_export para o arquivo bruto.",
+        )
+    return _doc_text_segment(read, source_id, doc_id, max_chars, offset)
+
+
+def _doc_text_segment(
+    read: TextResult, source_id: str, doc_id: int, max_chars: int, offset: int
+) -> dict[str, Any]:
+    """Monta o payload da janela [offset, offset+max_chars) de uma leitura ok.
+
+    Args:
+        read: ``TextResult`` do cliente (status ok; no_text tratado antes).
+        source_id: source no IPED.
+        doc_id: id do documento.
+        max_chars: máximo de caracteres da janela.
+        offset: caractere inicial da janela.
+
+    Returns:
+        Payload `status ok` com paginação; `no_text` quando o corpo é vazio
+        (HTTP 200 sem texto) ou o offset está além do fim — com capped sempre
+        presente (DESIGN 08 / M-8).
+    """
+    if not read.text.strip():
+        return _doc_text_no_text(
+            source_id,
+            doc_id,
+            "texto extraído vazio (HTTP 200 sem corpo); "
+            "use iped_doc_export para o arquivo bruto.",
+        )
+    segment = read.text[offset : offset + max_chars]
     if not segment:
-        return {
-            "source": source_id,
-            "doc_id": doc_id,
-            "no_text": True,
-            "note": f"offset {offset} além do fim do texto (total_chars={total_chars}).",
-        }
-    truncated = (offset + max_chars) < total_chars
+        return _doc_text_no_text(
+            source_id,
+            doc_id,
+            f"offset {offset} além do fim do texto (total_chars={read.total_chars}).",
+        )
+    truncated = (offset + max_chars) < read.total_chars
     result: dict[str, Any] = {
         "source": source_id,
         "doc_id": doc_id,
+        "status": TEXT_STATUS_OK,
         "text": segment,
-        "total_chars": total_chars,
+        "total_chars": read.total_chars,
         "offset": offset,
         "truncated": truncated,
         "next_offset": (offset + max_chars) if truncated else None,
+        "capped": read.capped,
     }
-    if capped:
-        result["capped"] = True
+    if read.capped:
         result["note"] = (
-            "texto truncado no teto de leitura (10 MB); total_chars é piso."
+            f"texto truncado no teto de leitura ({read.total_bytes} bytes "
+            "lidos, IPED_MCP_TEXT_CAP); total_chars é piso."
         )
     return result
+
+
+def _doc_text_no_text(source_id: str, doc_id: int, note: str) -> dict[str, Any]:
+    """Retorno canônico do estado no_text (DESIGN 08 / M-8 — status como dado).
+
+    Args:
+        source_id: source no IPED.
+        doc_id: id do documento.
+        note: explicação do sub-estado (sem texto no servidor, corpo vazio
+            ou offset além do fim) — os três preservam status no_text.
+
+    Returns:
+        Payload com status no_text, marcador legado no_text=true e capped=False.
+    """
+    return {
+        "source": source_id,
+        "doc_id": doc_id,
+        "status": TEXT_STATUS_NO_TEXT,
+        "no_text": True,
+        "capped": False,
+        "note": note,
+    }
 
 
 def doc_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:

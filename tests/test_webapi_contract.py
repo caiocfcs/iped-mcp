@@ -308,30 +308,40 @@ def test_content_missing_doc_raises_server_error(client: Any) -> None:
 
 
 def test_text_reads_full_stream_when_under_cap(client: Any) -> None:
-    """#12-WI7: stream chunked lido ate o fim; capped=False, total==len(texto)."""
-    text, total, capped = client.get_document_text(SOURCE_ID, DOC_TEXT_ID)
-    assert capped is False
-    assert text == TEXT_BODY.decode("utf-8")
-    assert total == len(text)
+    """#12-WI7: stream chunked lido ate o fim; capped=False, total==len(texto).
+
+    M-8: retorno e TextResult; os 3 primeiros campos preservam o contrato
+    legado (text, total_chars, capped) + status/total_bytes novos."""
+    result = client.get_document_text(SOURCE_ID, DOC_TEXT_ID)
+    assert result.capped is False
+    assert result.text == TEXT_BODY.decode("utf-8")  # AC5: campo text intacto
+    assert result.total_chars == len(result.text)
+    assert result.status == "ok"
+    assert result.total_bytes == len(TEXT_BODY)
+    assert result[0] == result.text  # contrato legado: indice 0 ainda e o texto
 
 
 def test_text_stops_at_max_bytes_and_flags_capped(client: Any) -> None:
-    """#12: acima de max_bytes para de ler e marca capped=True (cap 10 MB, client.py:143-168)."""
-    text, total, capped = client.get_document_text(SOURCE_ID, DOC_TEXT_ID, max_bytes=1024)
-    assert capped is True
-    assert total >= 1024
+    """#12: acima de max_bytes para de ler e marca capped=True (AC3)."""
+    result = client.get_document_text(SOURCE_ID, DOC_TEXT_ID, max_bytes=1024)
+    assert result.capped is True
+    assert result.total_chars >= 1024
+    assert result.status == "ok"
+    assert result.total_bytes >= 1024
 
 
-@pytest.mark.characterization
-def test_text_missing_doc_raises_server_error(client: Any) -> None:
-    """#12: /text de doc inexistente -> ServerError 500 (2d: /text 200/500/404).
+def test_text_missing_doc_becomes_no_text_status(client: Any) -> None:
+    """#12/M-8 AC1: /text 500 (doc sem texto no jar) vira ESTADO, nao excecao.
 
-    M-2 mantem 500 como ServerError (classe propria, nao ValueError): e o
-    gancho do M-8 para tratar status-como-dado neste endpoint."""
-    with pytest.raises(errors.ServerError) as exc:
-        client.get_document_text(SOURCE_ID, MISSING_DOC_ID)
-    assert exc.value.status_code == 500
-    assert exc.value.response is not None
+    Substitui o pino de characterization do M-2 (500=ServerError como
+    gancho do M-8): o gancho .response foi consumido — o 500 desta rota e
+    o contrato WONT_FIX P2-5 do fork e devolve status no_text + texto vazio.
+    """
+    result = client.get_document_text(SOURCE_ID, MISSING_DOC_ID)
+    assert result.status == "no_text"
+    assert result.text == ""
+    assert result.capped is False
+    assert result.total_bytes == 0
 
 
 def test_text_unknown_source_raises_not_found(client: Any) -> None:

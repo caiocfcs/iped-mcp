@@ -18,12 +18,13 @@ from typing import Any
 import requests
 from fastmcp import FastMCP
 
+from iped_mcp.client import TEXT_STATUS_NO_TEXT
 from iped_mcp.config import WORKERS
 from iped_mcp.core.tool import doc_export
 from iped_mcp.fetch import (
     fetch_docs_parallel,
     get_document_props,
-    get_document_text,
+    get_document_text_cached,
     search_ids,
 )
 from iped_mcp.whatsapp.collect import MessageRecord, collect_messages
@@ -48,6 +49,13 @@ from iped_mcp.whatsapp.queries import (
 
 DEFAULT_EXPORTS_DIR = "/tmp/iped_mcp/exports"
 EXPORTS_DIR = os.environ.get("IPED_MCP_EXPORTS_DIR", DEFAULT_EXPORTS_DIR)
+
+# Estado do anexo quando a leitura do /text falhou (rede/404) — distinto de
+# no_text, que é a resposta 500 do servidor sem texto extraível (M-8).
+TEXT_STATUS_UNAVAILABLE = "unavailable"
+# Marcador literal de truncamento gravado no artefato de export (DESIGN 08 /
+# M-8, AC4): texto capped nunca entra no JSON como se fosse completo.
+TEXT_CAPPED_MARKER = "[TRUNCADO em {total_bytes} bytes — capped]"
 
 _WA_HINT = "Use whatsapp_reference para conferir os campos e queries canônicas."
 
@@ -111,14 +119,40 @@ def _media_hash(props: dict[str, Any]) -> str | None:
     return None
 
 
+def _classify_attachment(entry: dict[str, Any], source_id: str, doc_id: int) -> None:
+    """Classifica o /text de um anexo como DADO (DESIGN 08 / M-8, padrão do
+    icaro iped_client.py:233-244): no_text/falha não abortam a coleta.
+
+    Args:
+        entry: entrada de mídia recém-criada (enriquecida no lugar).
+        source_id: source no IPED.
+        doc_id: doc do anexo.
+    """
+    result = get_document_text_cached(source_id, doc_id)
+    if result is None:
+        entry["attachment_status"] = TEXT_STATUS_UNAVAILABLE
+        return
+    entry["attachment_status"] = result.status
+    entry["attachment_text"] = result.text or None
+    entry["attachment_capped"] = result.capped
+    entry["attachment_bytes"] = result.total_bytes
+
+
 def _fetch_media(source_id: str, hashes: list[str]) -> dict[str, dict[str, Any]]:
     """Para cada sha-256: doc de mídia → transcrição (áudio) e/ou texto (PDF).
 
     Imagem → ambos None (F3.5: /text de imagem é vazio; sem OCR no escopo).
+    Anexos PDF entram classificados por estado (ok/no_text/unavailable +
+    capped), nunca por exceção (DESIGN 08 / M-8).
     """
 
     def _one(h: str) -> tuple[str, dict[str, Any] | None]:
-        entry: dict[str, Any] = {"transcription": None, "attachment_text": None}
+        entry: dict[str, Any] = {
+            "transcription": None,
+            "attachment_text": None,
+            "attachment_status": None,
+            "attachment_capped": False,
+        }
         try:
             ids = search_ids(build_media_by_hash(h), source_id, _WA_HINT)
             if not ids:
@@ -130,7 +164,7 @@ def _fetch_media(source_id: str, hashes: list[str]) -> dict[str, dict[str, Any]]
             category = _first(props.get("category"))
             content_type = _first(props.get("contentType"))
             if category == "PDF Documents" or content_type == "application/pdf":
-                entry["attachment_text"] = get_document_text(source_id, ids[0])
+                _classify_attachment(entry, source_id, ids[0])
         except (requests.RequestException, ValueError):
             return h, None
         return h, entry
@@ -152,6 +186,69 @@ def _prepare_export_dir(output_dir: str | None) -> tuple[str, bool]:
             f"Não foi possível criar o diretório de exportação '{target}': {e}"
         ) from e
     return target, output_dir is not None and os.path.isabs(str(output_dir))
+
+
+def _attachment_for(
+    rec: MessageRecord, media: dict[str, dict[str, Any]]
+) -> tuple[str | None, str | None, bool]:
+    """Anexo de uma mensagem: (texto, status, capped) a partir da mídia coletada.
+
+    Última mídia classificada vence (comportamento legado preservado); texto
+    capped é gravado com o marcador literal de truncamento para o artefato
+    nunca parecer completo (DESIGN 08 / M-8, AC4).
+
+    Args:
+        rec: mensagem com `linked_hashes` a consultar.
+        media: mapa sha-256 → entrada produzida por `_fetch_media`.
+
+    Returns:
+        (texto com marcador quando capped, status ok/no_text/unavailable,
+        flag capped). (None, None, False) sem anexo classificado.
+    """
+    text: str | None = None
+    status: str | None = None
+    capped = False
+    for h in rec.linked_hashes:
+        entry = media.get(h)
+        if not entry or entry.get("attachment_status") is None:
+            continue
+        status = str(entry.get("attachment_status"))
+        capped = bool(entry.get("attachment_capped"))
+        if entry.get("attachment_text") is not None:
+            text = str(entry["attachment_text"])
+            if capped:
+                text = "{}\n\n{}".format(
+                    text,
+                    TEXT_CAPPED_MARKER.format(
+                        total_bytes=int(entry.get("attachment_bytes") or 0)
+                    ),
+                )
+    return text, status, capped
+
+
+def _export_dir_warning(output_dir: str | None, target: str, is_abs: bool) -> str | None:
+    """Aviso sobre o destino do JSON exportado; None quando sem ressalva.
+
+    Args:
+        output_dir: parâmetro recebido pela tool (None = diretório padrão).
+        target: diretório efetivo criado por `_prepare_export_dir`.
+        is_abs: se o `output_dir` informado era caminho absoluto.
+
+    Returns:
+        Texto de aviso para o resultado da tool, ou None.
+    """
+    if output_dir is None:
+        return (
+            f"JSON gravado no diretório padrão {target}. "
+            "Para gravar no seu projeto, chame novamente passando output_dir "
+            "com o caminho absoluto da pasta exports/."
+        )
+    if not is_abs:
+        return (
+            f"output_dir '{output_dir}' é relativo e resolve contra o cwd do "
+            "servidor (não do seu projeto). Use um caminho absoluto."
+        )
+    return None
 
 
 # --- tools --------------------------------------------------------------------
@@ -483,6 +580,123 @@ def whatsapp_conversation_window(
     }
 
 
+def _export_window(start: str | None, end: str | None) -> tuple[str, str] | None:
+    """Janela de datas validada e normalizada para o export.
+
+    Args:
+        start: início informado (ISO 8601 ou DD/MM/YYYY[ HH:MM[:SS]]).
+        end: fim informado (mesmos formatos).
+
+    Returns:
+        Par (inicio, fim) normalizado, ou None quando nenhum limite veio.
+
+    Raises:
+        ValueError: apenas um dos dois limites informado, ou formato inválido
+            (propagado de `normalize_range`).
+    """
+    if not (start or end):
+        return None
+    if not (start and end):
+        raise ValueError("'start' e 'end' devem ser informados juntos.")
+    return normalize_range(start, end)
+
+
+def _selected_hashes(selected: list[MessageRecord]) -> list[str]:
+    """Hashes de mídia das mensagens, únicos e em ordem de aparição.
+
+    Args:
+        selected: mensagens selecionadas para o export.
+
+    Returns:
+        Lista determinística de sha-256 a coletar via `_fetch_media`.
+    """
+    hashes: list[str] = []
+    for rec in selected:
+        for h in rec.linked_hashes:
+            if h not in hashes:
+                hashes.append(h)
+    return hashes
+
+
+def _build_export_messages(
+    selected: list[MessageRecord],
+    fetched: list[tuple[int, dict | None]],
+    media: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Mensagens do artefato JSON: corpo, transcrição e anexo classificado.
+
+    Args:
+        selected: mensagens selecionadas (ordem cronológica).
+        fetched: propriedades por doc (par de `fetch_docs_parallel`).
+        media: anexos classificados por sha-256 (de `_fetch_media`).
+
+    Returns:
+        Mensagens no formato do export com `attachment_status` e
+        `attachment_capped` (DESIGN 08 / M-8).
+    """
+    messages = []
+    for rec, (_doc_id, props) in zip(selected, fetched):
+        body = _first(props.get("Message-Body")) if props else None
+        date = _first(props.get("Communication:Date")) if props else rec.date
+        transcription: str | None = None
+        for h in rec.linked_hashes:
+            entry = media.get(h)
+            if entry and entry["transcription"] is not None:
+                transcription = entry["transcription"]
+        attachment_text, attachment_status, attachment_capped = _attachment_for(
+            rec, media
+        )
+        messages.append(
+            {
+                "id": rec.doc_id,
+                "date": str(date) if date is not None else None,
+                "text": str(body) if body is not None else None,
+                "audio_transcription": transcription,
+                "attachment_text": attachment_text,
+                "attachment_status": attachment_status,
+                "attachment_capped": attachment_capped,
+            }
+        )
+    return messages
+
+
+def _write_export_json(
+    target: str,
+    source_id: str,
+    num: str,
+    window: tuple[str, str] | None,
+    now: datetime,
+    messages: list[dict[str, Any]],
+) -> str:
+    """Grava o artefato JSON do export e devolve o caminho absoluto.
+
+    Args:
+        target: diretório efetivo (de `_prepare_export_dir`).
+        source_id: source no IPED (compõe o nome do arquivo).
+        num: número normalizado do interlocutor (compõe o nome).
+        window: janela de datas registrada no artefato (None = sem recorte).
+        now: timestamp local usado no nome do arquivo e em `generated_at`.
+        messages: mensagens montadas por `_build_export_messages`.
+
+    Returns:
+        Caminho absoluto do JSON gravado.
+    """
+    path = os.path.abspath(
+        os.path.join(target, f"whatsapp_{source_id}_{num}_{now:%Y%m%d-%H%M%S}.json")
+    )
+    payload = {
+        "source": source_id,
+        "number": num,
+        "window": {"start": window[0], "end": window[1]} if window else None,
+        "generated_at": now.isoformat(timespec="seconds"),
+        "exported": len(messages),
+        "messages": messages,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+
 def whatsapp_export_conversation(
     source_id: str,
     number: str,
@@ -496,7 +710,10 @@ def whatsapp_export_conversation(
     Cada mensagem sai com id, date, text (Message-Body), audio_transcription
     (do doc de mídia via linkedItems) e attachment_text (texto extraído do
     PDF anexado via /text). Imagem → null (sem OCR no escopo); PDF Android
-    não tem linkedItems → null. O JSON é gravado em output_dir (ou
+    não tem linkedItems → null. Cada mensagem traz `attachment_status`
+    (ok/no_text/unavailable) e `attachment_capped`; texto truncado no teto
+    de leitura é gravado com o marcador "[TRUNCADO em N bytes — capped]"
+    (DESIGN 08 / M-8). O JSON é gravado em output_dir (ou
     $IPED_MCP_EXPORTS_DIR, ou /tmp/iped_mcp/exports) e o caminho absoluto é
     devolvido (conteúdo nunca entra em contexto).
 
@@ -512,11 +729,7 @@ def whatsapp_export_conversation(
     if not 1 <= limit <= 500:
         raise ValueError("limit deve estar entre 1 e 500.")
     num = _require_number(number)
-    window: tuple[str, str] | None = None
-    if start or end:
-        if not (start and end):
-            raise ValueError("'start' e 'end' devem ser informados juntos.")
-        window = normalize_range(start, end)
+    window = _export_window(start, end)
     records, _sha_map, dropped = collect_messages(source_id)
     conv = [r for r in records if r.kind == "chat" and r.key == num]
     if not conv:
@@ -532,50 +745,12 @@ def whatsapp_export_conversation(
     conv.sort(key=lambda r: r.date or "")
     selected = conv[:limit]
     fetched = fetch_docs_parallel(source_id, [r.doc_id for r in selected])
-    hashes: list[str] = []
-    for rec in selected:
-        for h in rec.linked_hashes:
-            if h not in hashes:
-                hashes.append(h)
-    media = _fetch_media(source_id, hashes)
-    messages = []
-    for rec, (_doc_id, props) in zip(selected, fetched):
-        body = _first(props.get("Message-Body")) if props else None
-        date = _first(props.get("Communication:Date")) if props else rec.date
-        transcription: str | None = None
-        attachment_text: str | None = None
-        for h in rec.linked_hashes:
-            entry = media.get(h)
-            if not entry:
-                continue
-            if entry["transcription"] is not None:
-                transcription = entry["transcription"]
-            if entry["attachment_text"] is not None:
-                attachment_text = entry["attachment_text"]
-        messages.append(
-            {
-                "id": rec.doc_id,
-                "date": str(date) if date is not None else None,
-                "text": str(body) if body is not None else None,
-                "audio_transcription": transcription,
-                "attachment_text": attachment_text,
-            }
-        )
+    media = _fetch_media(source_id, _selected_hashes(selected))
+    messages = _build_export_messages(selected, fetched, media)
     target, is_abs = _prepare_export_dir(output_dir)
-    now = datetime.now()
-    path = os.path.abspath(
-        os.path.join(target, f"whatsapp_{source_id}_{num}_{now:%Y%m%d-%H%M%S}.json")
+    path = _write_export_json(
+        target, source_id, num, window, datetime.now(), messages
     )
-    payload = {
-        "source": source_id,
-        "number": num,
-        "window": {"start": window[0], "end": window[1]} if window else None,
-        "generated_at": now.isoformat(timespec="seconds"),
-        "exported": len(messages),
-        "messages": messages,
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
     result: dict[str, Any] = {
         "source": source_id,
         "number": num,
@@ -584,18 +759,94 @@ def whatsapp_export_conversation(
         "total_in_conversation": len(conv),
         "dropped_docs": dropped,
     }
-    if output_dir is None:
-        result["warning"] = (
-            f"JSON gravado no diretório padrão {target}. "
-            "Para gravar no seu projeto, chame novamente passando output_dir "
-            "com o caminho absoluto da pasta exports/."
-        )
-    elif not is_abs:
-        result["warning"] = (
-            f"output_dir '{output_dir}' é relativo e resolve contra o cwd do "
-            "servidor (não do seu projeto). Use um caminho absoluto."
-        )
+    warning = _export_dir_warning(output_dir, target, is_abs)
+    if warning:
+        result["warning"] = warning
     return result
+
+
+def _message_hits(source_id: str, term: str) -> Counter:
+    """Camada 1: hits por interlocutor no corpo das mensagens (token Lucene).
+
+    Args:
+        source_id: source no IPED.
+        term: termo buscado (ja trimado).
+
+    Returns:
+        Contador numero → nº de docs de mensagem com hit.
+    """
+    hits: Counter = Counter()
+    msg_ids = search_ids(build_message_term_query(term), source_id, _WA_HINT)
+    for _doc_id, props in fetch_docs_parallel(source_id, msg_ids):
+        if not props:
+            continue
+        name = str(_first(props.get("name")) or "")
+        m = PRIVATE_NAME_RE.match(name)
+        if m:
+            hits[m.group(1)] += 1
+    return hits
+
+
+def _audio_hits(source_id: str, term: str, sha_map: dict[str, set[str]]) -> Counter:
+    """Camada 2: hits por interlocutor na transcrição de áudios vinculados.
+
+    Args:
+        source_id: source no IPED.
+        term: termo buscado (query Lucene de transcrição).
+        sha_map: sha-256 da mídia → chaves de conversa (de collect_messages).
+
+    Returns:
+        Contador numero → nº de áudios transcritos com hit.
+    """
+    hits: Counter = Counter()
+    aud_ids = search_ids(build_audio_term_query(term), source_id, _WA_HINT)
+    for _doc_id, props in fetch_docs_parallel(source_id, aud_ids):
+        if not props:
+            continue
+        for key in sha_map.get(_media_hash(props) or "") or ():
+            hits[key] += 1
+    return hits
+
+
+def _attachment_hits(source_id: str, term: str, sha_map: dict[str, set[str]]) -> Counter:
+    """Camada 3: substring case-insensitive no /text de todos os PDFs do source.
+
+    PDF sem texto extraível (no_text) ou falha de leitura é CLASSIFICADO e o
+    fluxo segue — nunca aborta a varredura (DESIGN 08 / M-8). Leitura via
+    cache de texto (o mesmo doc pode aparecer em várias varreduras).
+
+    Args:
+        source_id: source no IPED.
+        term: termo buscado (comparação em minúsculas).
+        sha_map: sha-256 da mídia → chaves de conversa (de collect_messages).
+
+    Returns:
+        Contador numero → nº de PDFs anexados com hit.
+    """
+    hits: Counter = Counter()
+    pdf_ids = search_ids(build_pdf_query(), source_id, _WA_HINT)
+    term_lower = term.lower()
+    pdf_targets: list[tuple[int, tuple[str, ...]]] = []
+    for doc_id, props in fetch_docs_parallel(source_id, pdf_ids):
+        if not props:
+            continue
+        keys = tuple(sha_map.get(_media_hash(props) or "") or ())
+        if keys:
+            pdf_targets.append((doc_id, keys))
+
+    def _pdf_hit(item: tuple[int, tuple[str, ...]]) -> tuple[tuple[str, ...], bool]:
+        doc_id, keys = item
+        result = get_document_text_cached(source_id, doc_id)
+        if result is None or result.status == TEXT_STATUS_NO_TEXT:
+            return keys, False
+        return keys, term_lower in result.text.lower()
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for keys, hit in pool.map(_pdf_hit, pdf_targets):
+            if hit:
+                for key in keys:
+                    hits[key] += 1
+    return hits
 
 
 def whatsapp_text_search(source_id: str, term: str, top: int = 10) -> dict[str, Any]:
@@ -619,43 +870,9 @@ def whatsapp_text_search(source_id: str, term: str, top: int = 10) -> dict[str, 
         raise ValueError("top deve ser >= 1.")
     term = term.strip()
     records, sha_map, dropped = collect_messages(source_id)
-    msg_hits: Counter = Counter()
-    msg_ids = search_ids(build_message_term_query(term), source_id, _WA_HINT)
-    for _doc_id, props in fetch_docs_parallel(source_id, msg_ids):
-        if not props:
-            continue
-        name = str(_first(props.get("name")) or "")
-        m = PRIVATE_NAME_RE.match(name)
-        if m:
-            msg_hits[m.group(1)] += 1
-    aud_hits: Counter = Counter()
-    aud_ids = search_ids(build_audio_term_query(term), source_id, _WA_HINT)
-    for _doc_id, props in fetch_docs_parallel(source_id, aud_ids):
-        if not props:
-            continue
-        for key in sha_map.get(_media_hash(props) or "") or ():
-            aud_hits[key] += 1
-    att_hits: Counter = Counter()
-    pdf_ids = search_ids(build_pdf_query(), source_id, _WA_HINT)
-    term_lower = term.lower()
-    pdf_targets: list[tuple[int, tuple[str, ...]]] = []
-    for doc_id, props in fetch_docs_parallel(source_id, pdf_ids):
-        if not props:
-            continue
-        keys = tuple(sha_map.get(_media_hash(props) or "") or ())
-        if keys:
-            pdf_targets.append((doc_id, keys))
-
-    def _pdf_hit(item: tuple[int, tuple[str, ...]]) -> tuple[tuple[str, ...], bool]:
-        doc_id, keys = item
-        text = get_document_text(source_id, doc_id)
-        return keys, bool(text) and term_lower in text.lower()
-
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for keys, hit in pool.map(_pdf_hit, pdf_targets):
-            if hit:
-                for key in keys:
-                    att_hits[key] += 1
+    msg_hits = _message_hits(source_id, term)
+    aud_hits = _audio_hits(source_id, term, sha_map)
+    att_hits = _attachment_hits(source_id, term, sha_map)
     all_keys = set(msg_hits) | set(aud_hits) | set(att_hits)
     ranked = [
         {
