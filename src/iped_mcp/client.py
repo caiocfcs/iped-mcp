@@ -370,6 +370,34 @@ class IPEDClient:
         """
         return self._get("sources/", timeout=timeout)["data"]
 
+    def get_categories(self, source_id: str | None = None) -> list[str]:
+        """Taxonomia real de categorias do endpoint (GET /categories).
+
+        O endpoint é por servidor (não por source): `source_id` entra só
+        como contexto do erro. Envelope `{"data": [...]}` — contrato
+        pinado pelo uso no ICARO (iped_client.py:194-196).
+
+        Args:
+            source_id: source envolvida (apenas contexto do erro).
+
+        Returns:
+            Nomes de categoria na ordem do servidor.
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`);
+                jar sem o endpoint chega como `ResourceNotFoundError`
+                (HTTP 404 — builds sem /categories, cf. 2d dos
+                endpoints ausentes).
+            IpedResponseError: resposta sem a lista `data`.
+        """
+        payload = self._get("categories", source_id=source_id)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            raise IpedResponseError(
+                f"Resposta de /categories sem a lista 'data' (source '{source_id}')."
+            )
+        return [str(name) for name in data]
+
     def search(
         self,
         query: str,

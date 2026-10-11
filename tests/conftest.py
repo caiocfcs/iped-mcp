@@ -21,7 +21,9 @@ efêmera, num thread daemon (AC6 do Design 01 — suíte 100% offline).
 from __future__ import annotations
 
 import json
+import re
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -114,6 +116,14 @@ class FakeWebAPI:
         bookmarks: {nome: [{"source", "ids"}]} (forma real 2a/2c).
         requests_log: Um dict por pedido recebido (method, path, raw_target,
             query, req_body, status, resp_body) para pin de URL/params.
+        categories: catálogo do GET /categories (vazio = sem categorias).
+        category_hits: {categoria: [ids}] para queries category:"<cat>".
+        has_categories_endpoint: False simula jar SEM o endpoint (404).
+        fail_search_queries: queries `q` exatas que respondem 500 (falha
+            parcial de censo).
+        search_latency_s: latência artificial por /search (medição de
+            concorrência do censo); 0 = sem latência (suíte existente).
+        search_peak_inflight: pico observado de /search simultâneos.
     """
 
     base_url: str = ""
@@ -121,6 +131,14 @@ class FakeWebAPI:
     docs: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
     bookmarks: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     requests_log: list[dict[str, Any]] = field(default_factory=list)
+    categories: list[str] = field(default_factory=list)
+    category_hits: dict[str, list[int]] = field(default_factory=dict)
+    has_categories_endpoint: bool = True
+    fail_search_queries: set[str] = field(default_factory=set)
+    search_latency_s: float = 0.0
+    search_inflight: int = 0
+    search_peak_inflight: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def source_ids(self) -> set[str]:
         """Conjunto de ids de sources registrados no fake."""
@@ -137,6 +155,9 @@ class FakeWebAPI:
             inexistente = 0 hits mudo, WI-16).
         """
         q = query.replace("\\:", ":")
+        cat = re.fullmatch(r'category:"([^"]*)"', q)
+        if cat:
+            return list(self.category_hits.get(cat.group(1), []))
         if q.lower().startswith("md5:"):
             value = q.split(":", 1)[1]
             return [DOC_NO_IMAGE_ID] if value.upper() == DOC_MD5_UPPER else []
@@ -285,6 +306,8 @@ class FakeAPIHandler(BaseHTTPRequestHandler):
             return self._route_search()
         if parts[:1] == ["bookmarks"]:
             return self._route_bookmarks(method, parts)
+        if method == "GET" and parts[:1] == ["categories"]:
+            return self._route_categories()
         self._send(404, "text/plain", b"not found")
 
     def _read_body(self) -> bytes:
@@ -334,13 +357,42 @@ class FakeAPIHandler(BaseHTTPRequestHandler):
         body = JPEG_BODY if doc_id == DOC_TEXT_ID else b""
         self._send(200, "image/jpg", body)
 
+    def _route_categories(self) -> None:
+        """GET /categories: {"data": [nomes]} (contrato icaro :194-196).
+
+        Com `has_categories_endpoint=False` responde 404 text/plain — o
+        padrao dos endpoints ausentes no jar-alvo (2d: /properties,
+        /case-summary) — para pinar o caminho de erro do censo (M-6).
+        """
+        if not self.api.has_categories_endpoint:
+            return self._send(404, "text/plain", b"not found")
+        self._json({"data": list(self.api.categories)})
+
     def _route_search(self) -> None:
-        """GET /search (#2): source desconhecido -> 404; senao grupos sem total."""
+        """GET /search (#2): source desconhecido -> 404; senao grupos sem total.
+
+        Instrumentacao do censo (M-6): `fail_search_queries` responde 500
+        para as queries exatas listadas; `search_latency_s` latencia
+        artificial permite medir o pico de buscas simultaneas.
+        """
+        api = self.api
         query = self._entry["query"]
         sid = query.get("sourceID", [None])[0]
-        if sid is not None and sid not in self.api.source_ids():
+        if sid is not None and sid not in api.source_ids():
             return self._source_not_found(sid)
-        ids = self.api.search_ids(query.get("q", [""])[0])
+        q = query.get("q", [""])[0]
+        if q in api.fail_search_queries:
+            return self._grizzly_500()
+        if api.search_latency_s:
+            with api.lock:
+                api.search_inflight += 1
+                api.search_peak_inflight = max(api.search_peak_inflight, api.search_inflight)
+            try:
+                time.sleep(api.search_latency_s)
+            finally:
+                with api.lock:
+                    api.search_inflight -= 1
+        ids = api.search_ids(q)
         data = [{"source": sid or SOURCE_ID, "ids": ids}] if ids else []
         self._json({"data": data})
 
@@ -416,9 +468,11 @@ def fake_router(webapi: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     Tambem zera os caches de fetch.py para evitar contaminacao entre testes.
     """
     from iped_mcp import fetch, router as router_mod
+    from iped_mcp.core import census as census_mod
 
     monkeypatch.setattr(fetch, "_cache", {})
     monkeypatch.setattr(fetch, "_text_cache", {})
+    monkeypatch.setattr(census_mod, "_result_cache", {})
     router = router_mod.Router({"default": webapi.base_url})
     monkeypatch.setattr(router_mod, "_router", router)
     return router

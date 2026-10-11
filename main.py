@@ -22,6 +22,8 @@ mcp = FastMCP(
         "(devolve contagem + amostra de IDs), iped_doc_info mostra propriedades, "
         "iped_doc_text lê o texto (truncado), iped_doc_export/iped_thumb_export "
         "baixam arquivo bruto/thumbnail para o disco. "
+        "Antes de refinar buscas, iped_case_summary faz o censo por categoria "
+        "de um source (contagens e avisos; nenhum id de documento na resposta). "
         "Para atributos ufed: (IMEI, ICCID, etc.), use ufed_search ou ufed_device_info; "
         "ufed_list_fields mostra os campos válidos. "
         "Para atributos Regex:* (CNPJ, CPF, URL, etc.), comece com regex_list_types; "
