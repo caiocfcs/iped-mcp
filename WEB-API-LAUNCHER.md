@@ -35,7 +35,7 @@ Sem argumentos, o script usa:
 
 - root: diretorio atual (`./`)
 - sources: `./multicases.json`
-- host: `0.0.0.0`
+- host: `127.0.0.1` (somente a propria maquina)
 - primeira porta: `1234`
 
 ## Informando a pasta root e o JSON
@@ -44,7 +44,10 @@ Sem argumentos, o script usa:
 python web-api-launcher.py --root "C:\caminho\para\iped" --sources "C:\caminho\multicases.json"
 ```
 
-Tambem e possivel alterar host e porta inicial:
+Tambem e possivel alterar host e porta inicial. Por padrao a API escuta
+apenas em `127.0.0.1`. Para expor as portas a rede, informe `--host` com
+um endereco externo explicito; o launcher entao imprimira um aviso,
+porque a WebAPI nao possui autenticacao:
 
 ```powershell
 python web-api-launcher.py --root "C:\caminho\para\iped" --sources ".\multicases.json" --host 0.0.0.0 --start-port 1234
@@ -87,8 +90,8 @@ No Windows, os processos Java sao associados a um Job Object configurado com `KI
 [INICIANDO] source=src2 porta=1236
 
 === SERVIDORES IPED INICIADOS ===
-- src1: http://0.0.0.0:1234/  (PID 14220)
-- src2: http://0.0.0.0:1236/  (PID 15304)
+- src1: http://127.0.0.1:1234/  (PID 14220)
+- src2: http://127.0.0.1:1236/  (PID 15304)
 
 Pressione Ctrl+C para encerrar todos os servidores.
 ```
@@ -111,4 +114,4 @@ O script encerra todas as instancias. Fechar a janela do terminal tambem encerra
 
 - A verificacao inicial de porta reduz conflitos, mas outro processo ainda poderia ocupar a porta no intervalo minimo entre o teste e a abertura pelo Java. Se a API Java falhar imediatamente, o launcher informa o erro e encerra todas as instancias ja iniciadas.
 - O script espera 350 ms para detectar falhas imediatas. A listagem indica que o processo continuou ativo, nao que um endpoint HTTP especifico respondeu.
-- Por padrao, a API escuta em todas as interfaces usando `0.0.0.0`. Para limitar o acesso ao proprio computador, use `--host 127.0.0.1`. Observe as regras de firewall e seguranca do ambiente.
+- Por padrao, a API escuta somente em `127.0.0.1` (acesso local). A exposicao a rede e opt-in: exige `--host` com endereco externo e emite aviso, pois a WebAPI nao tem autenticacao: qualquer maquina que alcance a porta le todos os dados do caso. Quem dependia da exposicao implicita das versoes anteriores deve passar a informar `--host 0.0.0.0` (ou o endereco desejado) explicitamente. Observe as regras de firewall e seguranca do ambiente.
