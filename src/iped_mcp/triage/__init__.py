@@ -10,6 +10,7 @@ from fastmcp import FastMCP
 
 from iped_mcp.triage.financial import register as register_financial
 from iped_mcp.triage.geolocation import register as register_geolocation
+from iped_mcp.triage.devices_networks import register as register_devices_networks
 from iped_mcp.triage.identity import register as register_identity
 from iped_mcp.triage.media import register as register_media
 from iped_mcp.triage.telephony import register as register_telephony
@@ -29,6 +30,7 @@ def register(mcp: FastMCP) -> None:
     register_geolocation(mcp)
     register_identity(mcp)
     register_media(mcp)
+    register_devices_networks(mcp)
     register_telephony(mcp)
     register_transcripts(mcp)
 

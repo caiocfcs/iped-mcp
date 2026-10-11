@@ -430,7 +430,10 @@ def _truncated_payload(
         "field_hits_omitted": field_hits_omitted,
         "http_budget_exceeded": budget.exceeded,
         "http_budget_calls_at_stop": budget.used if budget.exceeded else None,
-        "docs_omitted_by_budget": len(docs_omitted),
+        # docs_omitted carrega a QUANTIDADE num único elemento
+        # (contrato _fetch_within_budget: docs_omitted[0],
+        # identity.py:1204-1206) — por isso sum(), não len().
+        "docs_omitted_by_budget": sum(docs_omitted),
     }
 
 

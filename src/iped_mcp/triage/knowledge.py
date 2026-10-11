@@ -886,3 +886,97 @@ MEDIA_GPS_ZERO_WARNING = (
     "varrida (o índice pode usar outra variante — sinalizador de "
     "descoberta, não afirma ausência de GPS no caso)"
 )
+
+# --- T-7 dispositivos/redes: baldes, parse e tetos (DESIGN 09-B §7) -------------
+
+# O único balde de LOG deste eixo vem da categoria "logs" — o bucket do
+# ICARO é o marcador "log" na categoria minúscula
+# (devices_networks_strategy.py:70-72). wifi/bluetooth chegam de PROPS de
+# docs do eixo identidade; no MCP, T-7 re-sonda pelas mesmas categorias de
+# T-3 derivadas por filtro (design §7.2, DRY regra 9 — jamais réplica
+# literal das tuplas).
+DEVICES_NETWORKS_LOG_CATEGORY = "logs"            # devices_networks_strategy.py:70-72
+DEVICES_NETWORKS_LOG_MARKER = "log"               # :70 (bucket por substring)
+DEVICES_NETWORKS_WIRELESS_MARKER = "wireless"     # :77
+DEVICES_NETWORKS_WIFI_SOURCE_MARKER = "wifi"      # :77 (ufed:Source)
+DEVICES_NETWORKS_BLUETOOTH_MARKER = BLUETOOTH_MARKER  # :85 (mesma marca de T-3)
+
+# Filtro de IDENTITY_CATEGORIES (:207-214): pares EN/PT de redes sem fio.
+DEVICES_NETWORKS_WIRELESS_CATEGORIES = tuple(
+    category
+    for category in IDENTITY_CATEGORIES
+    if DEVICES_NETWORKS_WIRELESS_MARKER in category
+    or "sem fio" in category
+)
+# Bluetooth não é categoria em IDENTITY_CATEGORIES — o literal "bluetooth
+# devices" vive em IDENTITY_VALID_SOURCES (:218, identity_strategy.py:146)
+# e é reaproveitado por filtro (mesma marca :85 do bucket bluetooth).
+DEVICES_NETWORKS_BLUETOOTH_CATEGORIES = tuple(
+    category
+    for category in IDENTITY_VALID_SOURCES
+    if DEVICES_NETWORKS_BLUETOOTH_MARKER in category
+)
+
+# Campos de props dos três baldes (devices_networks_strategy.py:76-88;
+# logs_networks_normalizer.py:161/:170/:176).
+DN_UFED_SOURCE_FIELD = "ufed:Source"        # strategy :76
+DN_SSID_FIELDS = ("ufed:SSId", "ufed:SSID")  # strategy :78
+DN_LOG_BODY_FIELD = "ufed:Body"             # normalizer :161
+DN_APPLICATION_FIELD = "ufed:Application"   # normalizer :170
+DN_TIMESTAMP_FIELD = "ufed:TimeStamp"       # normalizer :176
+
+# Regex literais do normalizer (portar é portar o normalizer — §7.1).
+# Body 'Service=CLOUDPHOTOLIBRARY IP=2804:...:a7b4' — formato estável (:40).
+DN_LOG_BODY_RE = r"\bService=(?P<service>[A-Za-z0-9_-]+)\s+IP=(?P<ip_raw>\S+)"
+# ufed:Application formato B: '<D73AP> <iPhone OS;26.6;23G71> <bundle/..>' (:43-47).
+DN_APP_BRACKETS_RE = (
+    r"<(?P<hw_model>[A-Za-z]\d+[A-Za-z]{0,3})>"
+    r"\s*<(?P<os_name>[^;<>]+);(?P<os_version>[\d.]+);(?P<build>[0-9A-Za-z]+)>"
+    r"(?:\s*<(?P<bundle>[\w.]+)/[^>]*>)?"
+)
+# ufed:Application formato C: 'fmflocatord/7.0 iPhone15,2/23F77' (:50-53).
+DN_APP_DAEMON_RE = (
+    r"^(?P<app>[\w.-]+)/(?P<app_version>[\d.]+)\s+"
+    r"(?P<model>(?:iPhone|iPad|iPod)\d+,\d+)/(?P<build>[0-9A-Za-z]+)\s*$"
+)
+# ufed:Application formato A: '23F77; iPhone15,2' (:56-58).
+DN_APP_PAIR_RE = (
+    r"^(?P<build>[0-9A-Za-z]{4,8});\s*"
+    r"(?P<model>(?:iPhone|iPad|iPod)\d+,\d+)\s*$"
+)
+# Fallback: qualquer identifier de aparelho no campo (:61).
+DN_MODEL_ANY_RE = r"\b((?:iPhone|iPad|iPod)\d+,\d+)\b"
+# ufed:TimeStamp: '14/08/2026 17:25:13 UTC' (:64).
+DN_TIMESTAMP_RE = r"^(?P<d>\d{2}/\d{2}/\d{4})\s+(?P<h>\d{2}:\d{2}:\d{2})"
+
+# Rótulos legíveis dos serviços iCloud (fallback = código cru) — normalizer
+# :68-82, literais.
+DN_SERVICE_LABELS = {
+    "FMIP": "Buscar (Find My)",
+    "FMF": "Localização de amigos (Find My Friends)",
+    "FINDMY": "Buscar (Find My)",
+    "CLOUDPHOTOLIBRARY": "Fotos do iCloud",
+    "ICLOUDDRIVE": "iCloud Drive",
+    "NOTES": "Notas (iCloud)",
+    "IMESSAGE": "Mensagens (iMessage)",
+    "CONTACTS": "Contatos (iCloud)",
+    "CALENDAR": "Calendário (iCloud)",
+    "ICLOUD": "iCloud (geral)",
+    "BACKUP": "Backup do iCloud",
+    "SETTINGS": "Ajustes (iCloud)",
+    "SAFARI": "Safari (iCloud)",
+}
+
+# Tetos de seção do envelope (§7.6). A timeline bruta do ICARO
+# (_MAX_RAW_CONNECTIONS=1000, normalizer :35/:254-255) NÃO existe no MCP —
+# o conceito portado é connections_truncated sobre a visão agregada.
+DN_CONNECTIONS_BY_IP_MAX = 50    # §7.6 [:50] por hits, marcado
+DN_WIFI_NETWORKS_MAX = 100       # §7.6 [:100]
+DN_BLUETOOTH_DEVICES_MAX = 100   # §7.6 [:100]
+
+# Eixo sem nada aproveitável: None no ICARO (build_payload :280-281); MCP:
+# vazio explícito com mensagem (§0.1, nunca exceção).
+DN_EMPTY_MESSAGE = (
+    "nenhum registro de rede/dispositivo aproveitável (logs Service/IP, "
+    "SSIDs ou nomes bluetooth) neste source"
+)
