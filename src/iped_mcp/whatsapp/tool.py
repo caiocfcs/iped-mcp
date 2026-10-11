@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -27,6 +28,7 @@ from iped_mcp.fetch import (
     get_document_text_cached,
     search_ids,
 )
+from iped_mcp.progress import op_envelope
 from iped_mcp.whatsapp.collect import MessageRecord, collect_messages
 from iped_mcp.whatsapp.queries import (
     MARKERS,
@@ -254,6 +256,83 @@ def _export_dir_warning(output_dir: str | None, target: str, is_abs: bool) -> st
 # --- tools --------------------------------------------------------------------
 
 
+def _collect_envelope(
+    started_at: float, records: list[MessageRecord], dropped: int
+) -> dict[str, Any]:
+    """Envelope M-9 da coleta WhatsApp (helper compartilhado pelas tools longas).
+
+    A coleta não é loteável por design: `sha_map` e todas as análises de
+    conversa exigem o corpus completo de mensagens, e o cache de 5 min já
+    amortiza a repetição (elapsed_s ≈ 0 no acerto informa o agente que nada
+    foi re-varrido). Varridos = docs de mensagem lidos (records + dropped).
+
+    Args:
+        started_at: `time.monotonic()` capturado no início da tool.
+        records: mensagens coletadas.
+        dropped: docs cujo fetch falhou (perda parcial sinalizada).
+
+    Returns:
+        Envelope de `op_envelope` sem chave `batch` (sem fatiamento).
+    """
+    return op_envelope(
+        started_at, scanned=len(records) + dropped, processed=len(records)
+    )
+
+
+def _overview_conversations(
+    records: list[MessageRecord], top: int
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Conta conversas por tipo e ordena o top-`top` por volume de mensagens."""
+    conv: dict[str, dict[str, Any]] = {}
+    for rec in records:
+        if rec.kind in ("chat", "group", "channel") and rec.key:
+            entry = conv.setdefault(
+                rec.key,
+                {"key": rec.key, "type": rec.kind, "messages": 0, "name": None},
+            )
+            entry["messages"] += 1
+            if rec.kind == "chat" and not entry["name"]:
+                entry["name"] = display_name(rec.name)
+    conversations: dict[str, Any] = {
+        "private": sum(1 for e in conv.values() if e["type"] == "chat"),
+        "group": sum(1 for e in conv.values() if e["type"] == "group"),
+        "channel": sum(1 for e in conv.values() if e["type"] == "channel"),
+    }
+    conversations["total"] = (
+        conversations["private"] + conversations["group"] + conversations["channel"]
+    )
+    top_conversations = sorted(conv.values(), key=lambda e: -e["messages"])[:top]
+    return conversations, top_conversations
+
+
+def _overview_interlocutors(
+    records: list[MessageRecord], owner_number: str | None, top: int
+) -> list[dict[str, Any]]:
+    """Ranqueia privadas por volume (enviadas/recebidas), exceto dono e artefato `0`."""
+    interloc: dict[str, dict[str, Any]] = {}
+    for rec in records:
+        if rec.kind != "chat" or not rec.key or rec.key == "0":
+            continue
+        if rec.key == owner_number:
+            continue
+        entry = interloc.setdefault(
+            rec.key,
+            {"number": rec.key, "name": None, "sent": 0, "received": 0},
+        )
+        if rec.to_number == rec.key:
+            entry["sent"] += 1
+        if rec.from_number == rec.key:
+            entry["received"] += 1
+        if not entry["name"]:
+            entry["name"] = display_name(rec.name)
+    return [
+        {**e, "messages": e["sent"] + e["received"]}
+        for e in sorted(
+            interloc.values(), key=lambda e: -(e["sent"] + e["received"])
+        )[:top]
+    ]
+
+
 def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
     """Triagem do WhatsApp no source: totais, período, série mensal, conversas distintas e top interlocutores.
 
@@ -262,17 +341,20 @@ def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
     privadas/grupos/canais e as conversas mais volumosas. `top_interlocutors`
     ranqueia conversas privadas por volume (enviadas/recebidas), excluindo o
     dono e o artefato `0`. A primeira chamada é pesada (coleta completa das
-    mensagens do source, minutos); as seguintes usam cache de 5 min.
+    mensagens do source, minutos); as seguintes usam cache de 5 min. O
+    envelope {scanned, processed, elapsed_s, phase} reporta a coleta da
+    chamada (elapsed_s ~0 = cache; a coleta não é loteável).
 
     Args:
         source_id: source no IPED (veja iped_list_sources).
         top: nº de conversas/interlocutores a devolver (padrão 10).
     """
+    started_at = time.monotonic()
     if top < 1:
         raise ValueError("top deve ser >= 1.")
     total_wa = len(search_ids("accountType:WhatsApp", source_id, _WA_HINT))
     if total_wa == 0:
-        return {"source": source_id, **_NO_WA_RESULT}
+        return {"source": source_id, **_NO_WA_RESULT, **_collect_envelope(started_at, [], 0)}
     total_messages = len(
         search_ids(
             'accountType:WhatsApp AND category:"Instant Messages"',
@@ -288,48 +370,10 @@ def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
         {"month": month, "messages": count}
         for month, count in sorted(monthly_counter.items())
     ]
-    conv: dict[str, dict[str, Any]] = {}
-    for rec in records:
-        if rec.kind in ("chat", "group", "channel") and rec.key:
-            entry = conv.setdefault(
-                rec.key,
-                {"key": rec.key, "type": rec.kind, "messages": 0, "name": None},
-            )
-            entry["messages"] += 1
-            if rec.kind == "chat" and not entry["name"]:
-                entry["name"] = display_name(rec.name)
-    conversations = {
-        "private": sum(1 for e in conv.values() if e["type"] == "chat"),
-        "group": sum(1 for e in conv.values() if e["type"] == "group"),
-        "channel": sum(1 for e in conv.values() if e["type"] == "channel"),
-    }
-    conversations["total"] = conversations["private"] + conversations["group"] + conversations["channel"]
-    top_conversations = sorted(conv.values(), key=lambda e: -e["messages"])[:top]
+    conversations, top_conversations = _overview_conversations(records, top)
     owner = _owner_info(source_id)
     owner_number = owner["owner_number"] if owner else None
-    interloc: dict[str, dict[str, Any]] = {}
-    for rec in records:
-        if rec.kind != "chat" or not rec.key or rec.key == "0":
-            continue
-        if owner_number and rec.key == owner_number:
-            continue
-        entry = interloc.setdefault(
-            rec.key,
-            {"number": rec.key, "name": None, "sent": 0, "received": 0},
-        )
-        if rec.to_number == rec.key:
-            entry["sent"] += 1
-        if rec.from_number == rec.key:
-            entry["received"] += 1
-        if not entry["name"]:
-            entry["name"] = display_name(rec.name)
-    top_interlocutors = [
-        {**e, "messages": e["sent"] + e["received"]}
-        for e in sorted(
-            interloc.values(), key=lambda e: -(e["sent"] + e["received"])
-        )[:top]
-    ]
-    return {
+    result: dict[str, Any] = {
         "source": source_id,
         "has_whatsapp": True,
         "total_wa": total_wa,
@@ -339,7 +383,7 @@ def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
         "monthly": monthly,
         "conversations": conversations,
         "top_conversations": top_conversations,
-        "top_interlocutors": top_interlocutors,
+        "top_interlocutors": _overview_interlocutors(records, owner_number, top),
         "owner": (
             {"number": owner_number, "excluded_from_interlocutors": True}
             if owner_number
@@ -350,6 +394,8 @@ def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
             "From/To (drift = eventos de sistema sem From/To)."
         ),
     }
+    result.update(_collect_envelope(started_at, records, dropped))
+    return result
 
 
 def whatsapp_account(source_id: str) -> dict[str, Any]:
@@ -468,6 +514,16 @@ def whatsapp_profile_photo(
     }
 
 
+def _conversation_series(
+    conv: list[MessageRecord], granularity: str
+) -> list[dict[str, Any]]:
+    """Série de intensidade da conversa: completa (month) ou top-10 (week/day)."""
+    buckets = Counter(bucket_key(r.date, granularity) for r in conv if r.date)
+    if granularity == "month":
+        return [{"bucket": b, "messages": c} for b, c in sorted(buckets.items())]
+    return [{"bucket": b, "messages": c} for b, c in buckets.most_common(10)]
+
+
 def whatsapp_conversation(
     source_id: str, number: str, granularity: str = "month"
 ) -> dict[str, Any]:
@@ -486,6 +542,7 @@ def whatsapp_conversation(
     """
     if granularity not in ("month", "week", "day"):
         raise ValueError("granularity deve ser month, week ou day.")
+    started_at = time.monotonic()
     num = _require_number(number)
     records, _sha_map, dropped = collect_messages(source_id)
     conv = [r for r in records if r.kind == "chat" and r.key == num]
@@ -499,19 +556,11 @@ def whatsapp_conversation(
                 "parecido (whatsapp_overview lista os interlocutores) — pode "
                 "ser conversa de grupo (Fase 4)."
             ),
+            **_collect_envelope(started_at, records, dropped),
         }
     sent = sum(1 for r in conv if r.to_number == num)
     received = sum(1 for r in conv if r.from_number == num)
     dates = sorted(r.date for r in conv if r.date)
-    buckets = Counter(bucket_key(r.date, granularity) for r in conv if r.date)
-    if granularity == "month":
-        series = [
-            {"bucket": b, "messages": c} for b, c in sorted(buckets.items())
-        ]
-    else:
-        series = [
-            {"bucket": b, "messages": c} for b, c in buckets.most_common(10)
-        ]
     return {
         "source": source_id,
         "number": num,
@@ -523,7 +572,11 @@ def whatsapp_conversation(
         "received": received,
         "no_direction": len(conv) - sent - received,
         "period": {"start": dates[0], "end": dates[-1]} if dates else None,
-        "intensity": {"granularity": granularity, "buckets": series},
+        "intensity": {
+            "granularity": granularity,
+            "buckets": _conversation_series(conv, granularity),
+        },
+        **_collect_envelope(started_at, records, dropped),
     }
 
 
@@ -697,6 +750,17 @@ def _write_export_json(
     return path
 
 
+def _export_filtered(
+    conv: list[MessageRecord], window: tuple[str, str] | None
+) -> list[MessageRecord]:
+    """Aplica a janela ISO opcional (comparação lexicográfica) e ordena por data."""
+    if window:
+        w_start, w_end = window
+        conv = [r for r in conv if r.date and w_start <= r.date <= w_end]
+    conv.sort(key=lambda r: r.date or "")
+    return conv
+
+
 def whatsapp_export_conversation(
     source_id: str,
     number: str,
@@ -728,6 +792,7 @@ def whatsapp_export_conversation(
     """
     if not 1 <= limit <= 500:
         raise ValueError("limit deve estar entre 1 e 500.")
+    started_at = time.monotonic()
     num = _require_number(number)
     window = _export_window(start, end)
     records, _sha_map, dropped = collect_messages(source_id)
@@ -738,11 +803,9 @@ def whatsapp_export_conversation(
             "number": num,
             "found": False,
             "hint": "nenhuma conversa privada com este número (ver whatsapp_overview).",
+            **_collect_envelope(started_at, records, dropped),
         }
-    if window:
-        w_start, w_end = window
-        conv = [r for r in conv if r.date and w_start <= r.date <= w_end]
-    conv.sort(key=lambda r: r.date or "")
+    conv = _export_filtered(conv, window)
     selected = conv[:limit]
     fetched = fetch_docs_parallel(source_id, [r.doc_id for r in selected])
     media = _fetch_media(source_id, _selected_hashes(selected))
@@ -762,6 +825,7 @@ def whatsapp_export_conversation(
     warning = _export_dir_warning(output_dir, target, is_abs)
     if warning:
         result["warning"] = warning
+    result.update(_collect_envelope(started_at, records, dropped))
     return result
 
 
@@ -868,6 +932,7 @@ def whatsapp_text_search(source_id: str, term: str, top: int = 10) -> dict[str, 
         raise ValueError("'term' não pode ser vazio.")
     if top < 1:
         raise ValueError("top deve ser >= 1.")
+    started_at = time.monotonic()
     term = term.strip()
     records, sha_map, dropped = collect_messages(source_id)
     msg_hits = _message_hits(source_id, term)
@@ -897,6 +962,7 @@ def whatsapp_text_search(source_id: str, term: str, top: int = 10) -> dict[str, 
             "total": len(all_keys),
         },
         "top": ranked[:top],
+        **_collect_envelope(started_at, records, dropped),
     }
 
 

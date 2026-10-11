@@ -9,6 +9,7 @@ from typing import Any
 from iped_mcp.fetch import cache_get as _cache_get
 from iped_mcp.fetch import cache_set as _cache_set
 from iped_mcp.fetch import fetch_docs_parallel, search_ids as _search_ids
+from iped_mcp.progress import BatchWindow, resolve_batch
 from iped_mcp.regex.queries import KNOWN_TYPES, build_regex_query
 
 _REGEX_HINT = "Use regex_list_types para conferir os tipos válidos."
@@ -38,21 +39,29 @@ class DocMatch:
 
 @dataclass
 class ScanResult:
+    """Resultado (possivelmente parcial) de um scan de atributo `Regex:*`.
+
+    Attributes:
+        total_docs: tamanho do DOMÍNIO (todos os ids da busca do detector),
+            mesmo quando a varredura foi loteada.
+        matches: docs com valores do atributo dentro do lote varrido.
+        scanned: docs efetivamente varridos nesta varredura (default: o
+            domínio inteiro, para construtores antigos sem lote).
+        window: janela de lote efetiva (None = varredura sem fatiamento).
+    """
+
     total_docs: int
     matches: list[DocMatch] = field(default_factory=list)
+    scanned: int | None = None
+    window: BatchWindow | None = None
+
+    def __post_init__(self) -> None:
+        if self.scanned is None:
+            self.scanned = self.total_docs
 
 
-def scan_attribute(source_id: str, attribute: str) -> ScanResult:
-    """Escaneia todos os docs onde o detector `attribute` casou.
-
-    Coleta os valores de `Regex:{attribute}` de cada doc (um doc pode ter
-    vários). Cache em memória por (source, attribute) com TTL de 5 min.
-    """
-    key = ("scan", source_id, attribute)
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached
-    ids = search_ids(build_regex_query(attribute), source_id)
+def _collect_matches(source_id: str, ids: list[int], attribute: str) -> list[DocMatch]:
+    """Lê as props dos ids do lote e extrai os valores `Regex:{attribute}`."""
     matches: list[DocMatch] = []
     for doc_id, props in fetch_docs_parallel(source_id, ids):
         if not props:
@@ -71,7 +80,50 @@ def scan_attribute(source_id: str, attribute: str) -> ScanResult:
                 values=values,
             )
         )
-    result = ScanResult(total_docs=len(ids), matches=matches)
+    return matches
+
+
+def regex_doc_ids(source_id: str, attribute: str) -> list[int]:
+    """Ids do domínio do detector (busca `Regex\\:ATTR:*`), cacheados por source.
+
+    O cache separado da lista de ids (M-9) é o que torna o fatiamento por
+    lotes barato: N invocadas com offset/limit reaproveitam a busca cara
+    em vez de re-executá-la a cada lote.
+    """
+    key = ("scan_ids", source_id, attribute)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    ids = search_ids(build_regex_query(attribute), source_id)
+    _cache_set(key, ids)
+    return ids
+
+
+def scan_attribute(
+    source_id: str, attribute: str, offset: int = 0, limit: int | None = None
+) -> ScanResult:
+    """Escaneia docs onde o detector `attribute` casou, por lote ou domínio todo.
+
+    Coleta os valores de `Regex:{attribute}` de cada doc do lote (um doc
+    pode ter vários). `offset`/`limit` fatiam o domínio (a busca do
+    detector sempre retorna TODOS os ids — o jar não pagina); o default
+    varre o domínio inteiro como antes. Cache em memória por
+    (source, attribute, offset, limit) e por (source, attribute) para os
+    ids, TTL de 5 min.
+    """
+    key = ("scan", source_id, attribute, offset, limit)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    ids = regex_doc_ids(source_id, attribute)
+    window = resolve_batch(len(ids), offset, limit)
+    matches = _collect_matches(source_id, ids[window.start : window.end], attribute)
+    result = ScanResult(
+        total_docs=len(ids),
+        matches=matches,
+        scanned=window.scanned,
+        window=window,
+    )
     _cache_set(key, result)
     return result
 

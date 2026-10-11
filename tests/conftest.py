@@ -163,14 +163,35 @@ class FakeWebAPI:
             return [DOC_NO_IMAGE_ID] if value.upper() == DOC_MD5_UPPER else []
         if q.startswith("ufed:MD5"):
             return [DOC_NO_IMAGE_ID]
-        if "Regex:EMAIL" in q:
-            return [DOC_NO_IMAGE_ID]
+        if q.startswith("Regex:"):
+            return self._regex_hits(q.split(":", 2)[1])
         if q == "*":
             # Match-all reflete o catalogo atual de docs do SOURCE_ID (M-7:
             # testes adicionam docs p/ amostragem; com o catalogo padrao o
             # resultado e identico a ALL_DOC_IDS, mesma ordem).
             return [i for (src, i) in self.docs if src == SOURCE_ID]
         return []
+
+    def _regex_hits(self, name: str) -> list[int]:
+        """Ids dos docs do SOURCE_ID com a propriedade `Regex:<name>` (M-9).
+
+        generalize o pino antigo (so EMAIL): o detector casa qualquer doc
+        que carregue a propriedade, preservando o resultado do catalogo
+        padrao (so DOC_NO_IMAGE_ID tem Regex:EMAIL) e a ordem do catalogo.
+
+        Args:
+            name: nome do detector sem o prefixo (ex.: EMAIL, TEST).
+
+        Returns:
+            Ids na ordem de insercao do catalogo; [] quando nada carrega a
+            propriedade (0 hits mudo, WI-16).
+        """
+        key = f"Regex:{name}"
+        return [
+            i
+            for (src_, i), d in self.docs.items()
+            if src_ == SOURCE_ID and key in d.get("properties", {})
+        ]
 
     def add_bookmark(self, name: str) -> None:
         """Cria bookmark vazio; idempotente (POST 200 mesmo se ja existe)."""
