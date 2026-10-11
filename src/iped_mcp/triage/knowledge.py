@@ -492,6 +492,7 @@ TOOL_BUDGETS = {
     "triage_media": 5100,  # 11 hints + 5000 docs (eixo mais denso)
     "triage_devices_networks": 3000,  # categorias pequenas
     "triage_communication": 3000,  # CHAT_SCAN_CAP 2500 + probes
+    "triage_query_discovery": 3000,  # 33 probes + 33x5 amostra + 9 sondas (T-10 §10.4)
 }
 # Aviso canônico de estouro (§2.3; NUNCA exceção, NUNCA silencioso).
 HTTP_BUDGET_WARNING_TEMPLATE = (
@@ -1297,3 +1298,102 @@ OWNER_ALIAS_STRIP_CHARS = (".", "_")    # engine :191 ('.'/'_' → espaço)
 OWNER_RE_NON_DIGIT = r"\D"              # engine :180-181 (dígitos p/ MSISDN)
 OWNER_EVIDENCE_SOURCES_SUFFIX = "."     # engine :459 (fecho da frase)
 OWNER_ACCOUNT_NAME_MIN_LEN = 3          # engine :159 (len(entity.name) > 2)
+
+# --- T-10 discovery: probes de frase, amostra e cache (DESIGN 09-B §10) ------
+
+# Probes de FRASE LUCENE (queries de conteúdo, NUNCA regex do usuário): a
+# lista literal do ICARO (iped-icaro/iped_query_discovery.py:39-106),
+# RECONTADA nesta fase em 33 termos — a FASE 3 registrou "37 probes"; o
+# design §12 manda portar a lista recontada, não o número do relatório.
+# Ordem e agrupamento do original preservados (comunicação → docs/mídia).
+DISCOVERY_PROBES = (
+    # Comunicação (:45-58)
+    "whatsapp",
+    "msgstore",
+    "wa.db",
+    "sms",
+    "mmssms",
+    "email",
+    "mail",
+    "telegram",
+    "signal",
+    "skype",
+    "messenger",
+    # Identidade (:62-66)
+    "google",
+    "gmail",
+    "accounts",
+    "contacts",
+    # Telefonia (:70-72)
+    "calllog",
+    "call log",
+    "calls",
+    # Geolocalização (:76-81)
+    "gps",
+    "location",
+    "geolocation",
+    "wifi",
+    "wi-fi",
+    "cell tower",
+    # Financeiro (:85-91)
+    "pix",
+    "comprovante",
+    "pagamento",
+    "transferência",
+    "transferencia",
+    "boleto",
+    # Documentos/mídia (:95-98)
+    "ocr",
+    "transcription",
+    "transcrição",
+)
+
+# Docs amostrados por probe com hits (M-7; paralelo search_debug
+# sample_size do ICARO :319-323 — histograma de campos por amostra).
+DISCOVERY_SAMPLE_SIZE = 5
+# TTL do catálogo por source: MESMA política dos caches de fetch/scan
+# (fetch.py:25 _CACHE_TTL = 300.0; precedente M-6/M-7). 2ª chamada na
+# janela = 0 GETs + warning catalogo_servido_de_cache (R-TRIAGE-1 §2.3).
+DISCOVERY_CACHE_TTL = 300.0
+# probes_que_o_veem sai truncado em 3 (shape §10.3).
+DISCOVERY_FIELD_PROBES_MAX = 3
+# Custo real do T-10 é ELAPSED (frases soltas = queries de conteúdo caras;
+# precedente 120 s de match-all): elapsed acima disto emite warning
+# sugerindo o reuso do cache (§10.4 — o agente decide, nunca aborta).
+DISCOVERY_SLOW_WARNING_S = 60.0
+# Buckets de tipo do shape §10.3 por substring da chave minúscula, fiel a
+# _inspect_properties (:439 mime, :450 extension). names/categories do
+# ICARO ficaram FORA do shape (nomes de arquivo = conteúdo potencial).
+DISCOVERY_MIME_KEY_TOKEN = "mime"
+DISCOVERY_EXTENSION_KEY_TOKEN = "extension"
+
+DISCOVERY_EMPTY_MESSAGE = (
+    "nenhum probe de frase encontrou hits e nenhum detector Regex respondeu; "
+    "catálogo vazio — confirme se a fonte foi indexada"
+)
+# Falha fiel ao ICARO (:338-353): probe que falha nomeia o erro e o build
+# segue — NUNCA aborta o catálogo.
+DISCOVERY_PROBE_FAILED_WARNING_TEMPLATE = (
+    "probe_falhou: '{probe}' — {error}; demais probes seguem executados "
+    "(falha registrada no bloco 'probes', catálogo PARCIAL por probe)"
+)
+DISCOVERY_NO_REGEX_DETECTOR_WARNING = (
+    "regex_detectores_indisponiveis: nenhum tipo de KNOWN_TYPES respondeu "
+    "hits (0 ou erro) — fonte sem varredura Regex ou build sem detectores"
+)
+# Divergência assumida (§10.2.3): o ICARO varre o RegexConfig.txt inteiro
+# (:204-282), arquivo externo ao MCP; a sonda honesta são os 9 canônicos.
+DISCOVERY_REGEX_SONDA_WARNING = (
+    "sonda=KNOWN_TYPES: detectores sondados = os 9 tipos canônicos do "
+    "iped-mcp; o RegexConfig.txt completo (varrido pelo ICARO :204-282) é "
+    "externo ao contrato do MCP"
+)
+DISCOVERY_CACHE_WARNING = (
+    "catalogo_servido_de_cache: resposta do cache por source (TTL 300 s), "
+    "0 GETs nesta chamada — dados podem ter até age_s segundos"
+)
+DISCOVERY_SLOW_WARNING_TEMPLATE = (
+    "elapsed={elapsed:.1f}s > {threshold}s: probes de frase são queries de "
+    "conteúdo caras; uma re-chamada dentro do TTL serve o catálogo do cache "
+    "(0 GETs) — ou releia apenas o bloco 'fields'"
+)
