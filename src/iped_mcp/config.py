@@ -116,3 +116,13 @@ TIMEOUT_READ_DOWNLOAD = _positive_seconds("IPED_MCP_TIMEOUT_READ_DOWNLOAD", 120.
 # para o operador ajustar por caso sem tocar codigo. Default PRESERVADO (AC2):
 # os 10 MB originais.
 TEXT_CAP_BYTES = _positive_int("IPED_MCP_TEXT_CAP", 10 * 1024 * 1024)
+
+
+# --- Diretório de exports (DESIGN 10 / M-10) ---------------------------------
+# Fonte ÚNICA do destino padrão para todas as tools que gravam artefatos
+# (core/bookmarks/regex/whatsapp). Antes era constante duplicada em
+# regex/tool.py e whatsapp/tool.py e não valia para core/bookmarks (que
+# exigiam dest_dir). A unificação completa da configuração de exports fica
+# com o M-17 (Lote 3); aqui só a fonte única + alcance de todas as tools.
+DEFAULT_EXPORTS_DIR = "/tmp/iped_mcp/exports"
+EXPORTS_DIR = os.environ.get("IPED_MCP_EXPORTS_DIR", DEFAULT_EXPORTS_DIR)

@@ -18,16 +18,21 @@ from typing import Any
 import requests
 from fastmcp import FastMCP
 
+from iped_mcp import config
 from iped_mcp.client import TEXT_STATUS_NO_TEXT, TEXT_STATUS_OK, TextResult
 from iped_mcp.diagnose import guarded_call
-from iped_mcp.download import resolve_filename
+from iped_mcp.download import (
+    export_path,
+    pick_export_name,
+    write_bytes_to,
+    write_stream_to,
+)
 from iped_mcp.fetch import text_cache_get, text_cache_set
 from iped_mcp.router import get_router
 
 # Busca genérica pode ser match-all (~66 s no source de teste); timeout padrão
 # (10 s) não basta. Mesma ordem de grandeza de _MATCH_ALL_TIMEOUT em regex/scan.py.
 _SEARCH_TIMEOUT = 120.0
-_CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 _SEARCH_HINT = (
     "Revise a sintaxe Lucene (docstring de iped_search) e os campos de extra_filters."
@@ -63,10 +68,16 @@ def _first(value: object) -> object:
 # Tradução de erros: política única em iped_mcp.diagnose.guarded_call (M-2).
 
 
-def _prepare_dest_dir(dest_dir: str) -> tuple[str, bool]:
-    """Valida/cria dest_dir → (caminho absoluto, era absoluto?)."""
+def _prepare_dest_dir(dest_dir: str | None) -> tuple[str, bool]:
+    """Valida/cria dest_dir → (caminho absoluto, era absoluto?).
+
+    M-10 (DESIGN 10): `dest_dir` omitido/vazio resolve contra
+    `config.EXPORTS_DIR` (`IPED_MCP_EXPORTS_DIR`, fonte única de todas as
+    tools de export); o default do operador é tratado como absoluto (não
+    há warning de cwd para configuração de deployment).
+    """
     if not dest_dir:
-        raise ValueError("'dest_dir' não pode ser vazio.")
+        return os.path.abspath(os.path.expanduser(config.EXPORTS_DIR)), True
     is_abs = os.path.isabs(dest_dir)
     target = os.path.abspath(os.path.expanduser(dest_dir))
     try:
@@ -78,15 +89,9 @@ def _prepare_dest_dir(dest_dir: str) -> tuple[str, bool]:
     return target, is_abs
 
 
-def _write_stream(resp: requests.Response, path: str) -> int:
-    """Escreve o stream em path; devolve os bytes gravados."""
-    size = 0
-    with open(path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
-            if chunk:
-                f.write(chunk)
-                size += len(chunk)
-    return size
+def _no_file_payload(source_id: str, doc_id: int, note: str) -> dict[str, Any]:
+    """Payload comum das variantes de 'doc sem arquivo' em `doc_export`."""
+    return {"source": source_id, "doc_id": doc_id, "no_file": True, "note": note}
 
 
 def _doc_name(source_id: str, doc_id: int) -> str | None:
@@ -407,17 +412,29 @@ def _doc_text_no_text(source_id: str, doc_id: int, note: str) -> dict[str, Any]:
     }
 
 
-def doc_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
-    """Salva o arquivo bruto de um documento em dest_dir (binário nunca entra em contexto).
+def doc_export(
+    source_id: str,
+    doc_id: int,
+    dest_dir: str | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Salva o arquivo bruto de um documento (binário nunca entra em contexto).
 
     O conteúdo é baixado em streaming para o disco; a tool devolve o path do
-    arquivo salvo (não os bytes). Filename do header Content-Disposition →
+    arquivo salvo (não os bytes). Nome do artefato (M-10):
+    `<UTC-ts>_<source>_<nome>` — uma reexecução NUNCA sobrescreve o export
+    anterior (colisão ganha sufixo `-N`; `overwrite=True` é a opt-in
+    explícita). A extensão segue o Content-Type real (P1-3) quando há mapa;
+    sem mapa vale a do nome. Filename do header Content-Disposition →
     fallback prop name → doc_{id}. Doc sem arquivo → no_file=true.
 
     Args:
         source_id: source no IPED (veja iped_list_sources).
         doc_id: id do documento (ex.: vindo de iped_search).
-        dest_dir: pasta de destino (recomendado: caminho absoluto; criada se não existir).
+        dest_dir: pasta de destino (recomendado: caminho absoluto; criada se
+            não existir; omissão usa `$IPED_MCP_EXPORTS_DIR`).
+        overwrite: True permite reescrever o MESMO arquivo na reexecução
+            (default False: artefato anterior é intocável — AC1/M-10).
     """
     target, is_abs = _prepare_dest_dir(dest_dir)
     client = get_router()
@@ -432,29 +449,24 @@ def doc_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
         with resp:
             if resp.headers.get("Content-Length") == "0":
                 return _relative_warning(
-                    {
-                        "source": source_id,
-                        "doc_id": doc_id,
-                        "no_file": True,
-                        "note": "doc sem arquivo (ex.: Device Information).",
-                    },
+                    _no_file_payload(
+                        source_id, doc_id, "doc sem arquivo (ex.: Device Information)."
+                    ),
                     is_abs,
                     dest_dir,
                 )
             doc_name = _doc_name(source_id, doc_id) if not header_filename else None
-            used: set[str] = set()
-            filename = resolve_filename(doc_id, header_filename, doc_name, used)
-            path = os.path.join(target, filename)
-            size = _write_stream(resp, path)
+            base = pick_export_name(doc_id, header_filename, doc_name)
+            path = export_path(
+                target, source_id, base,
+                content_type=resp.headers.get("Content-Type"),
+                overwrite=overwrite,
+            )
+            size = write_stream_to(path, resp)
             if size == 0:
                 os.remove(path)
                 return _relative_warning(
-                    {
-                        "source": source_id,
-                        "doc_id": doc_id,
-                        "no_file": True,
-                        "note": "doc sem arquivo (body vazio).",
-                    },
+                    _no_file_payload(source_id, doc_id, "doc sem arquivo (body vazio)."),
                     is_abs,
                     dest_dir,
                 )
@@ -463,7 +475,7 @@ def doc_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
                     "source": source_id,
                     "doc_id": doc_id,
                     "path": path,
-                    "filename": filename,
+                    "filename": os.path.basename(path),
                     "size": size,
                 },
                 is_abs,
@@ -475,17 +487,26 @@ def doc_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
         ) from exc
 
 
-def thumb_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
-    """Salva a thumbnail (JPEG 96x72) de um documento em dest_dir (binário nunca entra em contexto).
+def thumb_export(
+    source_id: str,
+    doc_id: int,
+    dest_dir: str | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Salva a thumbnail (JPEG 96x72) de um documento (binário nunca entra em contexto).
 
-    A thumbnail é baixada em streaming para o disco; a tool devolve o path do
-    arquivo salvo. Nome: {name}_thumb.jpg (fallback doc_{id}_thumb.jpg).
-    Doc sem imagem → no_thumb=true.
+    A thumbnail é baixada para o disco; a tool devolve o path do arquivo
+    salvo. Nome (M-10): `<UTC-ts>_<source>_<name>_thumb.jpg`
+    (fallback doc_{id}_thumb.jpg); reexecução nunca sobrescreve (colisão
+    → `-N`; `overwrite=True` é a opt-in explícita). Doc sem imagem →
+    no_thumb=true.
 
     Args:
         source_id: source no IPED (veja iped_list_sources).
         doc_id: id do documento (ex.: vindo de iped_search).
-        dest_dir: pasta de destino (recomendado: caminho absoluto; criada se não existir).
+        dest_dir: pasta de destino (recomendado: caminho absoluto; criada se
+            não existir; omissão usa `$IPED_MCP_EXPORTS_DIR`).
+        overwrite: True permite reescrever o MESMO arquivo na reexecução.
     """
     target, is_abs = _prepare_dest_dir(dest_dir)
     client = get_router()
@@ -512,16 +533,16 @@ def thumb_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
                 )
             name = _doc_name(source_id, doc_id)
             base = os.path.basename(str(name)) if name else f"doc_{doc_id}"
-            filename = f"{base}_thumb.jpg"
-            path = os.path.join(target, filename)
-            with open(path, "wb") as f:
-                f.write(data)
+            path = export_path(
+                target, source_id, f"{base}_thumb", ext=".jpg", overwrite=overwrite
+            )
+            write_bytes_to(path, data)
             return _relative_warning(
                 {
                     "source": source_id,
                     "doc_id": doc_id,
                     "path": path,
-                    "filename": filename,
+                    "filename": os.path.basename(path),
                     "size": len(data),
                 },
                 is_abs,

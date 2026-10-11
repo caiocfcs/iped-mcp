@@ -2,13 +2,15 @@
 
 O envelope de feedback (progresso/op_envelope) e o fatiamento por
 (offset, limit) da lista plana de docs permitem ao agente retomar/limitar
-um download de minutos em vez de esperar o bookmark inteiro cego.
+um download de minutos em vez de esperar o bookmark inteiro cego. Desde o
+M-10 (DESIGN 10) cada arquivo é gravado pelo helper único
+`iped_mcp.download.export_path`: nome `<UTC-ts>_<source>_<nome>`, extensão
+pelo Content-Type real (P1-3) e reserva atômica sem sobrescrita.
 """
 
 from __future__ import annotations
 
 import os
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -17,11 +19,15 @@ from typing import Any
 import requests
 
 from iped_mcp.config import WORKERS
-from iped_mcp.download import resolve_filename
+from iped_mcp.download import (
+    export_path,
+    pick_export_name,
+    resolve_export_dir,
+    write_stream_to,
+)
 from iped_mcp.progress import op_envelope, resolve_batch
 from iped_mcp.router import get_router
 
-_CHUNK_SIZE = 1024 * 1024  # 1 MB
 _MAX_FAILURES_REPORTED = 5  # teto legado de first_failures no envelope
 
 
@@ -42,16 +48,14 @@ def flatten_groups(groups: list[dict[str, Any]]) -> list[tuple[str, int]]:
 
 
 def _download_one(
-    client: Any,
-    dest_dir: str,
-    used_names: set[str],
-    lock: threading.Lock,
-    pair: tuple[str, int],
+    client: Any, dest_dir: str, overwrite: bool, pair: tuple[str, int]
 ) -> tuple[str, int, str, int]:
     """Baixa um (source, doc_id) → (status, doc_id, reason, bytes_written).
 
     Nunca levanta: doc sem arquivo (body vazio) → skipped; erro de rede ou
-    disco → failed com motivo (o chamador acumula em first_failures).
+    disco → failed com motivo (o chamador acumula em first_failures). A
+    reserva do nome é do helper único (M-10): colisão intra-lote, entre
+    lotes ou entre reexecuções ganha sufixo `-N` em vez de sobrescrever.
     """
     source, doc_id = pair
     try:
@@ -69,15 +73,15 @@ def _download_one(
                     doc_name = _first(props.get("name"))
                 except (requests.RequestException, ValueError):
                     doc_name = None
-            with lock:
-                filename = resolve_filename(doc_id, header_filename, doc_name, used_names)
-            path = os.path.join(dest_dir, filename)
-            bytes_written = 0
-            with open(path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
-                    if chunk:
-                        f.write(chunk)
-                        bytes_written += len(chunk)
+            base = pick_export_name(doc_id, header_filename, doc_name)
+            path = export_path(
+                dest_dir,
+                source,
+                base,
+                content_type=resp.headers.get("Content-Type"),
+                overwrite=overwrite,
+            )
+            bytes_written = write_stream_to(path, resp)
             if bytes_written == 0:
                 os.remove(path)
                 return "skipped", doc_id, "", 0
@@ -121,20 +125,19 @@ def _reduce(outcome: _Outcome, status: str, doc_id: int, reason: str, written: i
             outcome.first_failures.append({"id": doc_id, "reason": reason})
 
 
-def _run_downloads(client: Any, pairs: list[tuple[str, int]], dest_dir: str) -> _Outcome:
+def _run_downloads(
+    client: Any, pairs: list[tuple[str, int]], dest_dir: str, overwrite: bool
+) -> _Outcome:
     """Baixa `pairs` em paralelo (WORKERS threads) e acumula no outcome.
 
-    `used_names` nasce com os nomes ja presentes em `dest_dir`: sem isso, um
-    segundo lote do mesmo bookmark sobrescreveria silenciosamente arquivos do
-    primeiro lote que dividam o filename do Content-Disposition (mesma
-    perda de dados que a colisao intra-lote resolve com prefixo de doc id).
+    A reserva atômica do `export_path` (M-10) substitui o seed de
+    `os.listdir` criado no M-9: nome em uso nunca mais sobrescreve arquivo —
+    quem chega primeiro leva o nome-base e os demais ganham sufixo `-N`.
     """
-    used_names: set[str] = set(os.listdir(dest_dir))
-    lock = threading.Lock()
     outcome = _Outcome()
 
     def _one(pair: tuple[str, int]) -> tuple[str, int, str, int]:
-        return _download_one(client, dest_dir, used_names, lock, pair)
+        return _download_one(client, dest_dir, overwrite, pair)
 
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         for status, doc_id, reason, written in pool.map(_one, pairs):
@@ -143,24 +146,34 @@ def _run_downloads(client: Any, pairs: list[tuple[str, int]], dest_dir: str) -> 
 
 
 def download_bookmark(
-    bookmark: str, dest_dir: str, source_id: str, offset: int = 0, limit: int | None = None
+    bookmark: str,
+    dest_dir: str | None,
+    source_id: str,
+    offset: int = 0,
+    limit: int | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Baixa os arquivos de um bookmark para dest_dir (streaming, threads).
+    """Baixa os arquivos de um bookmark (streaming, threads) sem sobrescrever.
 
-    Doc sem arquivo (body vazio) → skipped. Falha em 1 doc não aborta o lote;
-    segue e reporta em failed (first_failures com até 5). `offset`/`limit`
-    fatiam a lista plana de docs do bookmark (ordem dos grupos preservada):
-    o default (0, None) baixa tudo como antes; com lote, `batch.has_more`
-    informa o que falta e a próxima chamada continua de offset + limit.
-    O envelope inclui os contadores da operação (scanned/processed/phase/
-    elapsed_s/remaining_est/batch — ver iped_mcp.progress).
+    Cada arquivo sai como `<UTC-ts>_<source>_<nome>` (M-10): reexecução do
+    mesmo bookmark cria artefatos NOVOS (colisão → `-N`), nunca destrói o
+    download anterior; `overwrite=True` é a opt-in explícita de reescrita.
+    `dest_dir` omitido/vazio usa `$IPED_MCP_EXPORTS_DIR`. Doc sem arquivo
+    (body vazio) → skipped. Falha em 1 doc não aborta o lote; segue e
+    reporta em failed (first_failures com até 5). `offset`/`limit` fatiam a
+    lista plana de docs do bookmark (ordem dos grupos preservada): o default
+    (0, None) baixa tudo como antes; com lote, `batch.has_more` informa o
+    que falta e a próxima chamada continua de offset + limit. O envelope
+    inclui os contadores da operação (scanned/processed/phase/elapsed_s/
+    remaining_est/batch — ver iped_mcp.progress).
 
     Args:
         bookmark: nome do bookmark.
-        dest_dir: pasta de destino (já expandida/absoluta pelo chamador).
+        dest_dir: pasta de destino (None/vazio = `$IPED_MCP_EXPORTS_DIR`).
         source_id: source no IPED que define o servidor.
         offset: docs a pular antes do lote (padrão 0 = tudo).
         limit: docs no lote (omitido = até o fim).
+        overwrite: True permite reescrever os MESMOS arquivos (default False).
 
     Returns:
         Envelope legado (saved/skipped/failed/total_bytes/dest_dir/
@@ -171,8 +184,9 @@ def download_bookmark(
     groups = client.get_bookmark_docs(bookmark, source_id)
     flat = flatten_groups(groups)
     window = resolve_batch(len(flat), offset, limit)
-    outcome = _run_downloads(client, flat[window.start : window.end], dest_dir)
+    target = resolve_export_dir(dest_dir)
+    outcome = _run_downloads(client, flat[window.start : window.end], target, overwrite)
     envelope = op_envelope(
         started_at, scanned=window.scanned, processed=outcome.saved, batch=window
     )
-    return {**outcome.payload(dest_dir), **envelope}
+    return {**outcome.payload(target), **envelope}

@@ -19,8 +19,10 @@ from typing import Any
 import requests
 from fastmcp import FastMCP
 
+from iped_mcp import config
 from iped_mcp.client import TEXT_STATUS_NO_TEXT
 from iped_mcp.config import WORKERS
+from iped_mcp.download import export_path, iso_utc, utc_now
 from iped_mcp.core.tool import doc_export
 from iped_mcp.fetch import (
     fetch_docs_parallel,
@@ -48,9 +50,6 @@ from iped_mcp.whatsapp.queries import (
     normalize_number,
     normalize_range,
 )
-
-DEFAULT_EXPORTS_DIR = "/tmp/iped_mcp/exports"
-EXPORTS_DIR = os.environ.get("IPED_MCP_EXPORTS_DIR", DEFAULT_EXPORTS_DIR)
 
 # Estado do anexo quando a leitura do /text falhou (rede/404) — distinto de
 # no_text, que é a resposta 500 do servidor sem texto extraível (M-8).
@@ -180,7 +179,7 @@ def _fetch_media(source_id: str, hashes: list[str]) -> dict[str, dict[str, Any]]
 
 
 def _prepare_export_dir(output_dir: str | None) -> tuple[str, bool]:
-    target = str(output_dir) if output_dir else EXPORTS_DIR
+    target = str(output_dir) if output_dir else config.EXPORTS_DIR
     try:
         os.makedirs(target, exist_ok=True)
     except OSError as e:
@@ -720,6 +719,7 @@ def _write_export_json(
     window: tuple[str, str] | None,
     now: datetime,
     messages: list[dict[str, Any]],
+    overwrite: bool = False,
 ) -> str:
     """Grava o artefato JSON do export e devolve o caminho absoluto.
 
@@ -728,20 +728,21 @@ def _write_export_json(
         source_id: source no IPED (compõe o nome do arquivo).
         num: número normalizado do interlocutor (compõe o nome).
         window: janela de datas registrada no artefato (None = sem recorte).
-        now: timestamp local usado no nome do arquivo e em `generated_at`.
+        now: timestamp UTC usado no nome do arquivo e em `generated_at`.
         messages: mensagens montadas por `_build_export_messages`.
+        overwrite: True reescreve o MESMO arquivo (default no-clobber M-10).
 
     Returns:
         Caminho absoluto do JSON gravado.
     """
-    path = os.path.abspath(
-        os.path.join(target, f"whatsapp_{source_id}_{num}_{now:%Y%m%d-%H%M%S}.json")
+    path = export_path(
+        target, source_id, f"whatsapp_{num}", ext=".json", now=now, overwrite=overwrite
     )
     payload = {
         "source": source_id,
         "number": num,
         "window": {"start": window[0], "end": window[1]} if window else None,
-        "generated_at": now.isoformat(timespec="seconds"),
+        "generated_at": iso_utc(now),
         "exported": len(messages),
         "messages": messages,
     }
@@ -768,6 +769,7 @@ def whatsapp_export_conversation(
     end: str | None = None,
     limit: int = 500,
     output_dir: str | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Exporta as mensagens de uma conversa privada do WhatsApp para um arquivo JSON local, com texto, transcrição de áudio e texto de PDF anexado.
 
@@ -778,8 +780,10 @@ def whatsapp_export_conversation(
     (ok/no_text/unavailable) e `attachment_capped`; texto truncado no teto
     de leitura é gravado com o marcador "[TRUNCADO em N bytes — capped]"
     (DESIGN 08 / M-8). O JSON é gravado em output_dir (ou
-    $IPED_MCP_EXPORTS_DIR, ou /tmp/iped_mcp/exports) e o caminho absoluto é
-    devolvido (conteúdo nunca entra em contexto).
+    $IPED_MCP_EXPORTS_DIR) e o caminho absoluto é devolvido (conteúdo nunca
+    entra em contexto). Nome do artefato (M-10):
+    `<UTC-ts>_<source>_whatsapp_<num>.json` — reexecução cria arquivo novo
+    (colisão ganha `-N`), nunca destrói o export anterior.
 
     Args:
         source_id: source no IPED (veja iped_list_sources).
@@ -788,7 +792,9 @@ def whatsapp_export_conversation(
         end: fim da janela opcional (mesmos formatos; start e end juntos).
         limit: máximo de mensagens (padrão 500, teto 500).
         output_dir: pasta de destino do JSON (recomendado: caminho absoluto;
-            sem o parâmetro, grava em /tmp/iped_mcp/exports).
+            sem o parâmetro, usa `$IPED_MCP_EXPORTS_DIR`).
+        overwrite: True permite reescrever o MESMO JSON na reexecução
+            (default False: nome único com timestamp UTC, sem sobrescrita).
     """
     if not 1 <= limit <= 500:
         raise ValueError("limit deve estar entre 1 e 500.")
@@ -812,7 +818,7 @@ def whatsapp_export_conversation(
     messages = _build_export_messages(selected, fetched, media)
     target, is_abs = _prepare_export_dir(output_dir)
     path = _write_export_json(
-        target, source_id, num, window, datetime.now(), messages
+        target, source_id, num, window, utc_now(), messages, overwrite
     )
     result: dict[str, Any] = {
         "source": source_id,

@@ -11,6 +11,8 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from iped_mcp import config
+from iped_mcp.download import export_path, iso_utc, utc_now
 from iped_mcp.progress import op_envelope
 from iped_mcp.regex.queries import (
     KNOWN_TYPES,
@@ -25,10 +27,6 @@ from iped_mcp.regex.scan import (
     scan_attribute,
     search_ids,
 )
-
-DEFAULT_EXPORTS_DIR = "/tmp/iped_mcp/exports"
-EXPORTS_DIR = os.environ.get("IPED_MCP_EXPORTS_DIR", DEFAULT_EXPORTS_DIR)
-
 
 def _first(value: object) -> object:
     if isinstance(value, list):
@@ -175,16 +173,6 @@ def regex_top_values(
     return result
 
 
-def _ensure_export_dir(target: str) -> None:
-    """Cria o diretório de exportação; ValueError com diagnóstico se falhar."""
-    try:
-        os.makedirs(target, exist_ok=True)
-    except OSError as e:
-        raise ValueError(
-            f"Não foi possível criar o diretório de exportação '{target}': {e}"
-        ) from e
-
-
 def _write_regex_csv(
     path: str, source_id: str, attr: str, scan: ScanResult, counter: Counter, now: datetime
 ) -> None:
@@ -192,7 +180,7 @@ def _write_regex_csv(
     with open(path, "w", newline="", encoding="utf-8") as f:
         f.write(f"# source: {source_id}\n")
         f.write(f"# attribute: Regex:{attr}\n")
-        f.write(f"# generated_at: {now.isoformat(timespec='seconds')}\n")
+        f.write(f"# generated_at: {iso_utc(now)}\n")
         f.write(f"# total_docs: {scan.total_docs}\n")
         if scan.window is not None and scan.window.limit is not None:
             f.write(
@@ -217,15 +205,19 @@ def regex_export_csv(
     output_dir: str | None = None,
     offset: int = 0,
     limit: int | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Exporta a tabela de frequência de um tipo `Regex:*` como CSV.
 
     Formato longo: 1 linha por match (doc x valor), colunas
     doc_id,name,md5,attribute,valor,frequencia. O cabeçalho do arquivo tem
-    metadados em linhas `#` (source, attribute, data, totais, distinct e,
-    em lote, a janela `# batch:`). O arquivo é gravado em output_dir (ou
-    $IPED_MCP_EXPORTS_DIR, ou /tmp/iped_mcp/exports) e o caminho absoluto é
-    devolvido. Escaneia os docs do lote (1 GET/doc); para tipos grandes
+    metadados em linhas `#` (source, attribute, data UTC, totais, distinct
+    e, em lote, a janela `# batch:`). Nome do artefato (M-10):
+    `<UTC-ts>_<source>_regex_<attr>.csv` — reexecução nunca sobrescreve o
+    CSV anterior (colisão ganha `-N`; `overwrite=True` é a opt-in
+    explícita). O arquivo é gravado em output_dir (ou
+    $IPED_MCP_EXPORTS_DIR) e o caminho absoluto é devolvido. Escaneia os
+    docs do lote (1 GET/doc); para tipos grandes
     (ex.: URL, ~150 mil docs) varra com `offset`/`limit` em vez de esperar
     os ~5-10 min do domínio inteiro (um CSV por lote).
 
@@ -238,16 +230,17 @@ def regex_export_csv(
         offset: docs a pular antes do lote (padrão 0 = domínio inteiro).
         limit: docs no lote (omitido = até o fim); o CSV do lote traz só os
             matches do lote, identificado na linha `# batch:` do arquivo.
+        overwrite: True permite reescrever o MESMO CSV na reexecução
+            (default False: artefato anterior é intocável — AC1/M-10).
     """
     started_at = time.monotonic()
     attr = normalize_attribute(attribute)
     scan = scan_attribute(source_id, attr, offset=offset, limit=limit)
     counter = _counter(scan)
-    now = datetime.now()
-    target = str(output_dir) if output_dir else EXPORTS_DIR
-    _ensure_export_dir(target)
-    path = os.path.abspath(
-        os.path.join(target, f"regex_{source_id}_{attr}_{now:%Y%m%d-%H%M%S}.csv")
+    now = utc_now()
+    target = str(output_dir) if output_dir else config.EXPORTS_DIR
+    path = export_path(
+        target, source_id, f"regex_{attr}", ext=".csv", now=now, overwrite=overwrite
     )
     _write_regex_csv(path, source_id, attr, scan, counter, now)
     result: dict[str, Any] = {

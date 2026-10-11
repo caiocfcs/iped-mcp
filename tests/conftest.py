@@ -124,6 +124,8 @@ class FakeWebAPI:
         search_latency_s: latência artificial por /search (medição de
             concorrência do censo); 0 = sem latência (suíte existente).
         search_peak_inflight: pico observado de /search simultâneos.
+        content_types: {doc_id: Content-Type} do GET /content (M-10: fixture
+            P1-3 — extensão do export deve seguir o type real do jar).
     """
 
     base_url: str = ""
@@ -138,6 +140,7 @@ class FakeWebAPI:
     search_latency_s: float = 0.0
     search_inflight: int = 0
     search_peak_inflight: int = 0
+    content_types: dict[int, str] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def source_ids(self) -> set[str]:
@@ -374,7 +377,8 @@ class FakeAPIHandler(BaseHTTPRequestHandler):
         headers = {}
         if doc_id != DOC_NO_DISPOSITION_ID:
             headers["Content-Disposition"] = f'attachment; filename="{CONTENT_FILENAME}"'
-        self._send(200, "application/octet-stream", JPEG_BODY, headers)
+        ctype = self.api.content_types.get(doc_id, "application/octet-stream")
+        self._send(200, ctype, JPEG_BODY, headers)
 
     def _send_thumb(self, doc_id: int) -> None:
         """GET /thumb: JPEG p/ doc 53; body vazio = sem imagem (2d 13b)."""
