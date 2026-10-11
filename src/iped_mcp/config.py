@@ -6,9 +6,21 @@ import os
 
 from dotenv import load_dotenv
 
-# load_dotenv() aqui (e não só em client.py) garante que IPED_MCP_WORKERS do
-# .env esteja visível independentemente da ordem de import dos módulos.
+# Ponto UNICO de carga do .env no projeto (M-17): garante que toda variavel
+# definida em .env esteja visivel a todos os modulos, independentemente da
+# ordem de import. O client.py tambem chamava load_dotenv() no baseline —
+# duplicacao erradicada (D-10: corrigir o default exigia mexer em 2 lugares).
 load_dotenv()
+
+
+# --- Endereco da WebAPI (M-17) ---------------------------------------------
+# Default e leitura do env `IPED_URL` moram SO aqui (fonte unica). O client
+# usa `IPED_URL` como default de base_url, resolvido na construcao. O router
+# mantem leitura propria em tempo de startup (semantica de exclusao mutua
+# com IPED_ENDPOINTS) e ficou fora do escopo de arquivos do M-17 —
+# follow-up registrado no relatorio da fase.
+DEFAULT_IPED_URL = "http://localhost:1234"
+IPED_URL = os.environ.get("IPED_URL", DEFAULT_IPED_URL)
 
 # Paralelismo de fetch (workers) e, por consequência, o pool de conexões do
 # requests (client.py casa pool_maxsize com este valor). 32 validado contra o

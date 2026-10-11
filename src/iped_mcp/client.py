@@ -26,14 +26,12 @@ traduz em ESTADO (`TextResult.status = no_text`), não em exceção
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Any, Callable, NamedTuple
 from urllib.parse import quote
 
 import requests
 from requests.adapters import HTTPAdapter
-from dotenv import load_dotenv
 
 from iped_mcp import config
 from iped_mcp.errors import (
@@ -51,9 +49,8 @@ from iped_mcp.resilience import CircuitBreaker, RetryPolicy
 
 logger = logging.getLogger("iped_mcp.client")
 
-load_dotenv()
-
-DEFAULT_IPED_URL = os.environ.get("IPED_URL", "http://localhost:1234")
+# M-17: o .env é carregado UMA unica vez por iped_mcp.config (import acima)
+# e o default de endereco da WebAPI tambem vem de la (config.IPED_URL).
 # Pool de conexões casado com o paralelismo de fetch (config.WORKERS): com o
 # pool padrão (10), workers > 10 descartam conexões ("pool is full") e parte
 # dos requests paga um novo handshake TCP. +8 de folga p/ buscas concorrentes.
@@ -139,6 +136,21 @@ class TextResult(NamedTuple):
     total_bytes: int = 0
 
 
+
+def _resolve_base_url(base_url: str | None) -> str:
+    """Resolve a URL base do cliente a partir do argumento ou do config.
+
+    Args:
+        base_url: URL informada pelo chamador; None pede o default do
+            ambiente (`config.IPED_URL`, env `IPED_URL`) -- fonte unica
+            M-17, resolvida na construcao e nao no import.
+
+    Returns:
+        A URL base sem barra final.
+    """
+    return (config.IPED_URL if base_url is None else base_url).rstrip("/")
+
+
 class IPEDClient:
     """Cliente para a API REST do IPED (um endpoint/base_url).
 
@@ -148,7 +160,7 @@ class IPEDClient:
 
     def __init__(
         self,
-        base_url: str = DEFAULT_IPED_URL,
+        base_url: str | None = None,
         timeout: float | None = None,
         *,
         session: requests.Session | None = None,
@@ -158,7 +170,9 @@ class IPEDClient:
         """Cria o cliente com pool de conexões e política de resiliência.
 
         Args:
-            base_url: URL base da WebAPI (sem barra final).
+            base_url: URL base da WebAPI (sem barra final); None usa
+                `config.IPED_URL` (env `IPED_URL`, default do baseline
+                `http://localhost:1234`) resolvido na construcao (M-17).
             timeout: override explícito único para todas as classes (usado em
                 teste/diagnóstico); None = cada método usa a sua classe de
                 timeout definida em `iped_mcp.config` (DESIGN 04).
@@ -169,7 +183,7 @@ class IPEDClient:
             clock: relógio monotônico do circuit breaker (injeção p/ teste);
                 padrão `time.monotonic`, resolvido na construção.
         """
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _resolve_base_url(base_url)
         # Classes de timeout resolvidas na construção a partir do config; o
         # parâmetro `timeout`, quando dado, sobrepõe todas (override único).
         ov = timeout
