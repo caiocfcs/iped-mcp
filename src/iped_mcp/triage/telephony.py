@@ -21,7 +21,7 @@ from iped_mcp import fetch
 from iped_mcp.progress import op_envelope
 from iped_mcp.router import get_router
 from iped_mcp.triage import knowledge
-from iped_mcp.triage.fields import first_str
+from iped_mcp.triage.fields import first_str, first_str_key
 
 _KIND_CALL = "call"
 _KIND_CONTACT = "contact"
@@ -54,11 +54,24 @@ class _ContactAgg:
     sample_doc_ids: list[int] = field(default_factory=list)
 
 
+def _zero_name_hits() -> dict[str, int]:
+    """Histograma zerado da whitelist de nome (mesma ordem de tentativa).
+
+    Returns:
+        ``{campo: 0}`` para todo ``CONTACT_NAME_FIELDS`` (cobertura honesta:
+        o envelope mostra os campos TESTADOS, não só os que casaram).
+    """
+    return dict.fromkeys(knowledge.CONTACT_NAME_FIELDS, 0)
+
+
 @dataclass
 class _Scan:
     """Contadores e avisos da varredura de um source (envelope §2.5)."""
 
     query_hits: dict[str, int] = field(default_factory=dict)
+    contact_name_field_hits: dict[str, int] = field(
+        default_factory=_zero_name_hits
+    )
     query_caps: list[str] = field(default_factory=list)
     total_cap_applied: bool = False
     docs_searched: int = 0
@@ -265,9 +278,48 @@ def _aggregate(pairs: list[tuple[int, dict | None]], scan: _Scan) -> dict[str, _
         if kind == _KIND_CALL:
             if _apply_call(contacts, doc_id, props):
                 scan.call_docs += 1
-        elif _apply_contact(contacts, doc_id, props):
-            scan.contact_docs += 1
+        else:
+            # Contagem ANTES da validação do telefone: o histograma mede a
+            # cobertura do CAMPO de nome (T-1.1 §1.3), não o êxito do registro.
+            _count_contact_name_field(scan, props)
+            if _apply_contact(contacts, doc_id, props):
+                scan.contact_docs += 1
     return contacts
+
+
+def _count_contact_name_field(scan: _Scan, props: dict[str, Any]) -> None:
+    """Registra qual campo da whitelist produziu o nome do contato (§1.3).
+
+    Args:
+        scan: contadores da varredura (mutado; histograma pré-sonda).
+        props: propriedades do doc do ramo contato.
+    """
+    _, field_key = first_str_key(props, knowledge.CONTACT_NAME_FIELDS)
+    if field_key:
+        scan.contact_name_field_hits[field_key] += 1
+
+
+def _name_origin_warnings(scan: _Scan) -> list[str]:
+    """Aviso T-1.1 §1.3 (veredito R1): clássico zerado com variante cobrindo.
+
+    Args:
+        scan: contadores da varredura.
+
+    Returns:
+        Um aviso ``nome_da_agenda_origem=<campo>`` quando o primeiro campo
+        da whitelist (``ufed:Name``) não produziu nada e uma variante
+        posterior produziu; vazio caso contrário (elimina o 0-silencioso).
+    """
+    classic = knowledge.CONTACT_NAME_FIELDS[0]
+    if scan.contact_name_field_hits.get(classic, 0) != 0:
+        return []
+    for field_key, hits in scan.contact_name_field_hits.items():
+        if field_key != classic and hits > 0:
+            return [
+                f"nome_da_agenda_origem={field_key} ('{classic}'=0 neste "
+                "build; cobertura da agenda via whitelist T-1.1)"
+            ]
+    return []
 
 
 def _contact_row(record: _ContactAgg) -> dict[str, Any]:
@@ -363,6 +415,7 @@ def _payload(
         sempre marcada em ``truncated``); ``message`` quando vazio.
     """
     scan.warnings.extend(_zero_hit_warnings(scan))
+    scan.warnings.extend(_name_origin_warnings(scan))
     return {
         "source_id": sid,
         "contacts": rows[: knowledge.TOP_CONTACTS],
@@ -377,6 +430,7 @@ def _payload(
             docs_fetched=scan.docs_fetched,
             call_docs=scan.call_docs,
             contact_docs=scan.contact_docs,
+            contact_name_field_hits=dict(scan.contact_name_field_hits),
             contacts_total=len(rows),
             cached=False,
         ),
@@ -435,6 +489,16 @@ def triage_telephony(source_id: str) -> dict[str, Any]:
     e nenhuma propriedade bruta. Contatos de agenda sem chamadas vêm com
     ``total_calls=0``/``score=50``/``BAIXA``.
 
+    O nome de agenda usa a whitelist ordenada T-1.1 (``ufed:Name`` ->
+    ``ufed:name`` -> ``userName`` -> ``ufed:userName``; primeiro campo com
+    valor vence). Divergência INTENCIONAL do ICARO-telephony (que lê só
+    ``ufed:Name``, telephony_strategy.py:117-118, e cobriria 0 nomes neste
+    build — veredito R1): a whitelist alinha o eixo à lista do
+    ICARO-identity (identity_strategy.py:358-362). O histograma
+    ``contact_name_field_hits`` no envelope diz qual campo produziu cada
+    nome, e um aviso ``nome_da_agenda_origem=<campo>`` marca a origem
+    quando o campo clássico fica em zero.
+
     Args:
         source_id: source a triar (veja iped_list_sources).
 
@@ -444,9 +508,9 @@ def triage_telephony(source_id: str) -> dict[str, Any]:
         relevance, justification, sample_doc_ids}], query_hits (por query;
         -1 = query que falhou), counters (phase/scanned/processed/
         elapsed_s/docs_searched/docs_fetched/call_docs/contact_docs/
-        contacts_total/cached), truncated (tetos SEMPRE marcados),
-        warnings}; ``message`` quando o eixo está vazio (contacts=[],
-        nunca exceção).
+        contact_name_field_hits/contacts_total/cached), truncated (tetos
+        SEMPRE marcados), warnings}; ``message`` quando o eixo está vazio
+        (contacts=[], nunca exceção).
 
     Raises:
         ValueError: source_id vazio, inexistente ou servidor indisponível

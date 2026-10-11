@@ -54,8 +54,24 @@ CALL_TO_FIELDS = ("Communication:To", "Communication:From")
 PHONE_FALLBACK_FIELDS = ("ufed:PhoneNumber", "Regex:PHONE")
 DIRECTION_FIELD = "ufed:Direction"  # origem: telephony_strategy.py:92
 DURATION_FIELD = "ufed:Duration"  # origem: telephony_strategy.py:100
-# Contato de agenda. Origem: telephony_strategy.py:117-118.
-CONTACT_NAME_FIELDS = ("ufed:Name",)
+# Contato de agenda: whitelist ORDENADA de campos de nome (T-1.1,
+# DESIGN 09-B §1.2). O literal original do ICARO-telephony era somente
+# ``ufed:Name`` (iped-icaro/strategies/telephony_strategy.py:117-118), que
+# vale 0 nomes neste build — FACT de runtime: ``ufed:Name`` = 0 em amostra
+# de 400 docs "contacts" (research/reports/phase-9-pilot-runtime.md §7;
+# veredito R1). O alargamento é decisão do operador (veredito R1) e alinha
+# o eixo à lista ordenada do ICARO-identity
+# (strategies/identity_strategy.py:358-362; o ramo WhatsApp usa userName
+# em :319). Divergência INTENCIONAL do ICARO-telephony, que leria 0 nomes
+# neste build. ``ufed:userName`` nunca foi observado em runtime
+# (TO_VERIFY-B1): entra como último candidato de sonda — custo zero por
+# doc em ``fields.first_str``, nunca removido.
+CONTACT_NAME_FIELDS = (
+    "ufed:Name",      # identidade/contatos clássicos — telephony:117, identity:359
+    "ufed:name",      # variante minúscula — identity_strategy.py:360
+    "userName",       # agenda deste build — identity:361 + runtime §7
+    "ufed:userName",  # variante a confirmar em runtime (TO_VERIFY-B1)
+)
 CONTACT_PHONE_FIELDS = ("ufed:PhoneNumber", "phoneNumber")
 
 # --- T-1 telefonia: extração -------------------------------------------------

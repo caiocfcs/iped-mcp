@@ -320,3 +320,123 @@ def test_chamada_sem_numero_util_e_ignorada(
     assert out["message"] == knowledge.TELEPHONY_EMPTY_MESSAGE
     assert out["counters"]["docs_fetched"] == 2
     assert out["counters"]["call_docs"] == 0
+
+
+# --- T-1.1 (DESIGN 09-B §1.5): whitelist de nome de contato ------------------
+
+
+def _add_named_contact(
+    api: Any,
+    doc_id: int,
+    name_field: str | None,
+    name: str,
+    phone: str = "5511988887777",
+    category: str = "contatos",
+) -> None:
+    """Contato de agenda com o nome em campo ARBITRÁRIO da whitelist T-1.1.
+
+    Args:
+        api: estado observável do FakeWebAPI.
+        doc_id: id do documento.
+        name_field: chave onde gravar o nome (None = nenhum campo de nome).
+        name: valor do nome.
+        phone: valor de ufed:PhoneNumber.
+        category: categoria do doc.
+    """
+    props: dict[str, Any] = {"category": [category], "ufed:PhoneNumber": [phone]}
+    if name_field:
+        props[name_field] = [name]
+    api.docs[(SOURCE_ID, doc_id)] = make_doc(doc_id, f"contacts-{doc_id}.vcf", props)
+    api.category_hits.setdefault(category, []).append(doc_id)
+
+
+def _http_paths(api: Any) -> list[str]:
+    """Paths (sem query) de todos os pedidos recebidos pelo fake."""
+    return [entry["path"] for entry in api.requests_log]
+
+
+@pytest.mark.parametrize(
+    "name_field",
+    ["ufed:Name", "ufed:name", "userName", "ufed:userName"],
+)
+def test_t11_cada_variante_da_whitelist_produz_nome(
+    webapi: Any, fake_router: Any, name_field: str
+) -> None:
+    """(a) Cada um dos 4 campos, isolado, extrai o nome do contato."""
+    _add_named_contact(webapi, 231, name_field, "Ana Pe")
+
+    out = telephony.triage_telephony(SOURCE_ID)
+
+    contact = out["contacts"][0]
+    assert contact["contact_name"] == "ANA PE"
+    assert out["counters"]["contact_docs"] == 1
+    assert out["counters"]["contact_name_field_hits"][name_field] == 1
+
+
+def test_t11_ordem_ufed_name_vence_userName(webapi: Any, fake_router: Any) -> None:
+    """(b) ufed:Name E userName no mesmo doc → ufed:Name vence (ordem)."""
+    _add_named_contact(webapi, 232, "ufed:Name", "Vencedor")
+    webapi.docs[(SOURCE_ID, 232)]["properties"]["userName"] = ["Perdedor"]
+
+    out = telephony.triage_telephony(SOURCE_ID)
+
+    assert out["contacts"][0]["contact_name"] == "VENCEDOR"
+    hits = out["counters"]["contact_name_field_hits"]
+    assert hits["ufed:Name"] == 1 and hits["userName"] == 0
+
+
+def test_t11_sem_campo_de_nome_interlocutor_desconhecido(
+    webapi: Any, fake_router: Any
+) -> None:
+    """(c) Doc de contato sem NENHUM campo da whitelist: sem registro novo e
+    o número atendido por chamada fecha com o DESCONHECIDO explícito
+    (behavior atual preservado, §1.5c)."""
+    _add_named_contact(webapi, 233, None, "", phone="5521977776666")
+    _add_call(webapi, 234, to="(5521977776666)")
+
+    out = telephony.triage_telephony(SOURCE_ID)
+
+    rows = {row["phone"]: row for row in out["contacts"]}
+    assert rows["5521977776666"]["contact_name"] == "DESCONHECIDO"
+    assert out["counters"]["contact_docs"] == 0
+    hits = out["counters"]["contact_name_field_hits"]
+    assert set(hits) == set(knowledge.CONTACT_NAME_FIELDS)
+    assert sum(hits.values()) == 0
+
+
+def test_t11_histograma_e_aviso_de_origem(webapi: Any, fake_router: Any) -> None:
+    """(d) Histograma confere com os docs do fake; ufed:Name=0 + userName>0 →
+    aviso 'nome_da_agenda_origem=userName' (elimina o 0-silencioso, §1.3)."""
+    _add_named_contact(webapi, 241, "userName", "Casa", phone="5511911111111")
+    _add_named_contact(webapi, 242, "userName", "Trabalho", phone="5511922222222")
+
+    out = telephony.triage_telephony(SOURCE_ID)
+
+    assert out["counters"]["contact_name_field_hits"] == {
+        "ufed:Name": 0,
+        "ufed:name": 0,
+        "userName": 2,
+        "ufed:userName": 0,
+    }
+    assert any("nome_da_agenda_origem=userName" in w for w in out["warnings"])
+    # origem clássica NÃO dispara o aviso
+    webapi.requests_log.clear()
+    _add_named_contact(webapi, 243, "ufed:Name", "Clássico", phone="5511933333333")
+    out2 = telephony.triage_telephony(SOURCE_ID)
+    assert not any("nome_da_agenda_origem" in w for w in out2["warnings"])
+
+
+def test_t11_contagem_de_requisicoes_inalterada(
+    webapi: Any, fake_router: Any
+) -> None:
+    """(e) Não-regressão de orçamento: a whitelist NÃO muda o nº de /search
+    (1 por categoria canônica) nem de /docs (1 por id único varrido)."""
+    _add_named_contact(webapi, 251, "userName", "Ana", phone="5511944444444")
+    _add_call(webapi, 252, to="(5511955555555)")
+
+    telephony.triage_telephony(SOURCE_ID)
+
+    paths = _http_paths(webapi)
+    assert paths.count("/search") == len(knowledge.TELEPHONY_CATEGORIES)
+    # GET de doc: sources/<sid>/docs/<id> (client.py:112)
+    assert sum("/docs/" in p for p in paths) == 2
