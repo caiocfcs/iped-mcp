@@ -12,6 +12,10 @@ e circuit breaker por base_url com sonda `GET /sources/`. Como o cliente
 é um por endpoint, o breaker "por base_url" é naturalmente um por
 instância. O teto de tempo de uma chamada é
 `tentativas × timeout + backoffs` (ver `iped_mcp.resilience`).
+
+Timeouts são por classe de operação (DESIGN 04 / M-4): busca, props,
+texto e download têm teto próprio, definido em `iped_mcp.config` e
+ajustável por env (`IPED_MCP_TIMEOUT_*`) sem tocar código.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 
-from iped_mcp.config import CB_PROBE_TIMEOUT_SECONDS, WORKERS
+from iped_mcp import config
 from iped_mcp.errors import (
     IpedConnectionError,
     IpedError,
@@ -44,18 +48,13 @@ logger = logging.getLogger("iped_mcp.client")
 load_dotenv()
 
 DEFAULT_IPED_URL = os.environ.get("IPED_URL", "http://localhost:1234")
-# Timeout de leitura (entre bytes) para download de arquivos; arquivos grandes
-# em conexões lentas podem levar mais que o timeout padrão.
-_CONTENT_READ_TIMEOUT = 120.0
-# Par (connect, read) dos endpoints de conteúdo (content/text/thumb).
-_STREAM_TIMEOUT = (10.0, _CONTENT_READ_TIMEOUT)
 # Teto de leitura do /text (chunked, sem Content-Length): evita estourar memória
 # em docs com texto extraído gigante. Acima disso, capped=True.
 _TEXT_READ_CAP = 10 * 1024 * 1024  # 10 MB
 # Pool de conexões casado com o paralelismo de fetch (config.WORKERS): com o
 # pool padrão (10), workers > 10 descartam conexões ("pool is full") e parte
 # dos requests paga um novo handshake TCP. +8 de folga p/ buscas concorrentes.
-_POOL_SIZE = WORKERS + 8
+_POOL_SIZE = config.WORKERS + 8
 # Tamanho do chunk de leitura do /text (iter_content).
 _TEXT_CHUNK_SIZE = 65536
 
@@ -70,7 +69,7 @@ class IPEDClient:
     def __init__(
         self,
         base_url: str = DEFAULT_IPED_URL,
-        timeout: float = 10,
+        timeout: float | None = None,
         *,
         session: requests.Session | None = None,
         sleeper: Callable[[float], None] | None = None,
@@ -80,7 +79,9 @@ class IPEDClient:
 
         Args:
             base_url: URL base da WebAPI (sem barra final).
-            timeout: timeout padrão de requisição, em segundos.
+            timeout: override explícito único para todas as classes (usado em
+                teste/diagnóstico); None = cada método usa a sua classe de
+                timeout definida em `iped_mcp.config` (DESIGN 04).
             session: sessão requests (injeção para teste); por padrão cria
                 uma com pool dimensionado para o fetch paralelo.
             sleeper: função de espera do backoff (injeção para teste);
@@ -89,8 +90,18 @@ class IPEDClient:
                 padrão `time.monotonic`, resolvido na construção.
         """
         self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self._stream_timeout = (self.timeout, _CONTENT_READ_TIMEOUT)
+        # Classes de timeout resolvidas na construção a partir do config; o
+        # parâmetro `timeout`, quando dado, sobrepõe todas (override único).
+        ov = timeout
+        self.timeout = config.TIMEOUT_DEFAULT if ov is None else ov
+        self._search_timeout = config.TIMEOUT_SEARCH if ov is None else ov
+        self._props_timeout = config.TIMEOUT_PROPS if ov is None else ov
+        self._text_timeout = config.TIMEOUT_TEXT if ov is None else ov
+        # Par (connect, read) dos endpoints de download (content/thumb).
+        self._download_timeout = (
+            config.TIMEOUT_CONNECT_DOWNLOAD if ov is None else ov,
+            config.TIMEOUT_READ_DOWNLOAD if ov is None else ov,
+        )
         if session is None:
             session = requests.Session()
             adapter = HTTPAdapter(
@@ -127,7 +138,7 @@ class IPEDClient:
             resp = self._session.request(
                 "GET",
                 f"{self.base_url}/sources/",
-                timeout=CB_PROBE_TIMEOUT_SECONDS,
+                timeout=config.CB_PROBE_TIMEOUT_SECONDS,
             )
             return resp.status_code == 200
         except requests.RequestException:
@@ -153,7 +164,8 @@ class IPEDClient:
         Args:
             method: verbo HTTP ("GET", "POST", "PUT", "DELETE").
             path: caminho relativo à base_url.
-            timeout: segundos, ou par (connect, read); padrão `self.timeout`.
+            timeout: segundos, ou par (connect, read); ausente → `self.timeout`
+                (override do construtor ou default das operações curtas).
             source_id: source envolvida (contexto da mensagem de erro).
             doc_id: doc envolvido; marca endpoint de documento, onde o
                 jar-alvo responde 500 para doc inexistente (2d 10).
@@ -373,7 +385,8 @@ class IPEDClient:
         Args:
             query: query Lucene.
             source_id: source a restringir a busca (None = todos do servidor).
-            timeout: timeout desta chamada.
+            timeout: timeout desta chamada; None = classe de busca
+                (`TIMEOUT_SEARCH`, 30 s default — DESIGN 04).
 
         Returns:
             Grupos [{source, ids}] — sem paginação server-side (WI-1).
@@ -387,13 +400,16 @@ class IPEDClient:
         return self._get(
             "search",
             params=params,
-            timeout=timeout,
+            timeout=timeout if timeout is not None else self._search_timeout,
             source_id=source_id,
             retry_server_errors=False,
         )["data"]
 
     def get_document(self, source_id: str, doc_id: int) -> dict[str, Any]:
         """Retorna o documento (incluindo `properties`).
+
+        Timeout da classe props (`TIMEOUT_PROPS`, 90 s default): responder o
+        doc completo pode reabrir SQLite/Media.tar no servidor (DESIGN 04).
 
         Args:
             source_id: source do doc.
@@ -408,7 +424,10 @@ class IPEDClient:
                 "Doc não encontrado".
         """
         return self._get(
-            f"sources/{source_id}/docs/{doc_id}", source_id=source_id, doc_id=doc_id
+            f"sources/{source_id}/docs/{doc_id}",
+            timeout=self._props_timeout,
+            source_id=source_id,
+            doc_id=doc_id,
         )
 
     # --- Bookmarks (marcadores) ---
@@ -525,7 +544,7 @@ class IPEDClient:
         resp = self._request(
             "GET",
             f"sources/{source_id}/docs/{doc_id}/content",
-            timeout=self._stream_timeout,
+            timeout=self._download_timeout,
             source_id=source_id,
             doc_id=doc_id,
         )
@@ -557,7 +576,7 @@ class IPEDClient:
         resp = self._request(
             "GET",
             f"sources/{source_id}/docs/{doc_id}/text",
-            timeout=self._stream_timeout,
+            timeout=self._text_timeout,
             source_id=source_id,
             doc_id=doc_id,
         )
@@ -591,7 +610,7 @@ class IPEDClient:
         return self._request(
             "GET",
             f"sources/{source_id}/docs/{doc_id}/thumb",
-            timeout=self._stream_timeout,
+            timeout=self._download_timeout,
             source_id=source_id,
             doc_id=doc_id,
         )
