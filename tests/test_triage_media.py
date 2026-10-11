@@ -417,13 +417,14 @@ def test_gps_presente_nao_gera_warning(webapi: Any, fake_router: Any) -> None:
 def test_query_500_vira_hit_negativo_e_warning_sem_parar(
     webapi: Any, fake_router: Any
 ) -> None:
-    """500 em uma categoria: -1 + warning nominal; demais seguem normais."""
+    """500 numa variante: -1 + warning nominal; variante e grupos seguem."""
     webapi.fail_search_queries.add('category:"video"')
     _add_media_doc(webapi, 100, {}, category="image")
 
     out = media.triage_media(SOURCE_ID)
 
     assert out["query_hits"]['category:"video"'] == -1
+    assert out["query_hits"]['category:"videos"'] == 0  # sondou a variante
     assert any('category:"video"' in w and "falhou" in w for w in out["warnings"])
     assert out["query_hits"][IMAGE_QUERY] == 1
     assert out["items_total"] == 1
@@ -438,38 +439,60 @@ def test_source_inexistente_vira_value_error_estavel(fake_router: Any) -> None:
 def test_eixo_vazio_e_mensagem_explicita_sem_excecao(
     webapi: Any, fake_router: Any
 ) -> None:
-    """Nada de mídia: message explícita + as 10 queries pagas; sem exceção."""
+    """Nada de mídia: message explícita + as 19 probes dos grupos pagas.
+
+    M-TR-1: cada categoria vira um grupo ordenado de variantes; com 0 hit
+    em tudo, paga-se o grupo inteiro (21 literais em knowledge.
+    MEDIA_CATEGORY_VARIANTS) e cada grupo gera warning nominal (M-7).
+    """
     out = media.triage_media(SOURCE_ID)
 
     assert set(out) == ENVELOPE_KEYS | {"message"}
     assert out["message"] == knowledge.MEDIA_EMPTY_MESSAGE
-    assert out["counters"]["http_calls"] == len(knowledge.MEDIA_CATEGORIES)
+    probes = sum(len(g) for g in knowledge.MEDIA_CATEGORY_VARIANTS)
+    assert probes == 21
+    assert out["counters"]["http_calls"] == probes
+    zero = [w for w in out["warnings"] if "variantes sondadas sem hits" in w]
+    assert len(zero) == len(knowledge.MEDIA_CATEGORY_VARIANTS) == 10
 
 
 def test_orcamento_estourado_vira_parcial_marcado(
     webapi: Any, fake_router: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cap 12 = 10 queries + 2 docs: parcial não vazio, nunca exceção (§2.3)."""
-    monkeypatch.setitem(knowledge.TOOL_BUDGETS, "triage_media", 12)
-    for i in range(3):
+    """Cap 13 tingido no laço de /search: 1 doc entra, 3 fora — nunca exc.
+
+    M-TR-1 (ordem real pinnada): image vence na 1ª variante (1 search, 4
+    candidatos); video (2) + audio (2) + document (3) + pdf (2) + download
+    (2) + spreadsheet (2) zerados = 12; presentation paga só a 1ª variante
+    (13 = cap) e morre antes de "presentations". Os 4 candidatos ficam sem
+    /docs: ``docs_omitted_by_budget == 4`` e o eixo fecha VAZIO mas
+    MARCADO (partial + truncated + warning + message) — o corte no tráfego
+    de /search nunca é exceção nem silêncio (política R-TRIAGE-1).
+    """
+    monkeypatch.setitem(knowledge.TOOL_BUDGETS, "triage_media", 13)
+    for i in range(4):
         _add_media_doc(webapi, 300 + i, {}, name=f"b{i}.jpg")
 
     out = media.triage_media(SOURCE_ID)
 
     counters, truncated = out["counters"], out["truncated"]
     assert (counters["phase"], counters["http_calls"]) == (
-        progress.PHASE_PARTIAL, 12,
+        progress.PHASE_PARTIAL, 13,
     )
     assert truncated["http_budget_exceeded"] is True
-    assert truncated["docs_omitted_by_budget"] == 1
-    assert any("http_budget_exceeded" in w and "cap 12" in w for w in out["warnings"])
-    assert out["items_total"] == 2  # parcial NÃO vazio
+    assert truncated["http_budget_calls_at_stop"] == 13
+    assert truncated["docs_omitted_by_budget"] == 4
+    assert "category:\"presentations\"" not in out["query_hits"]  # cortada
+    assert any("http_budget_exceeded" in w and "cap 13" in w for w in out["warnings"])
+    assert out["items_total"] == 0 and "message" in out  # vazio, mas partial
+    assert out["counters"]["phase"] == progress.PHASE_PARTIAL
+
 
 
 def test_http_calls_exato_e_igual_ao_trafego_do_fake(
     webapi: Any, fake_router: Any
 ) -> None:
-    """Pino de exatidão: 10 queries + N docs == http_calls == fake."""
+    """Pino de exatidão: 11 probes (image vence cedo) + N docs == fake."""
     for i in range(3):
         _add_media_doc(webapi, 310 + i, {}, name=f"c{i}.jpg")
     webapi.requests_log.clear()
@@ -479,8 +502,8 @@ def test_http_calls_exato_e_igual_ao_trafego_do_fake(
     paths = [entry["path"] for entry in webapi.requests_log]
     searches = paths.count("/search")
     docs = sum("/docs/" in p for p in paths)
-    assert searches == len(knowledge.MEDIA_CATEGORIES) == 10
-    assert out["counters"]["http_calls"] == searches + docs == 10 + 3
+    assert searches == 19  # image vence na 1ª variante; os demais zeram o grupo
+    assert out["counters"]["http_calls"] == searches + docs == 19 + 3
     assert out["truncated"]["http_budget_exceeded"] is False
 
 
@@ -510,3 +533,86 @@ def test_tool_registrada_via_mcp(fake_router: Any, webapi: Any) -> None:
     payload = asyncio.run(_run())
     assert payload["source_id"] == SOURCE_ID
     assert payload["message"] == knowledge.MEDIA_EMPTY_MESSAGE
+
+
+# --- M-TR-1: variantes de categoria (singular legado + plural do jar) -------------
+
+
+def test_mtr1_plural_visto_quando_singular_da_zero(
+    webapi: Any, fake_router: Any
+) -> None:
+    """F1 reproduzida no fake (matcher exato): só "images" casa → categoria vista.
+
+    No jar real image=0 vs images=38.057; o fake tem o MESMO matcher
+    phrase-exato, então este pino exercita o caminho exato da F1: a literal
+    do ICARO é tentada primeiro (0), a variante plural entra e o item é
+    triado normalmente.
+    """
+    _add_media_doc(webapi, 900, {"ocrCharCount": ["10"]}, category="images",
+                   name="evid.jpg")
+
+    out = media.triage_media(SOURCE_ID)
+
+    assert out["query_hits"]['category:"image"'] == 0
+    assert out["query_hits"]['category:"images"'] == 1
+    assert out["items_total"] == 1
+    assert out["ranked_items"][0]["category"] == "images"
+    assert not [
+        w for w in out["warnings"]
+        if "categoria 'image'" in w and "variantes sondadas" in w
+    ]  # grupo com hit NÃO gera warning de 0
+
+
+def test_mtr1_singular_legado_vence_e_parou_na_primeira_variante(
+    webapi: Any, fake_router: Any
+) -> None:
+    """Literal do ICARO vence quando existe: "videos" NUNCA é sondado.
+
+    Paridade com o ICARO preservada (o que ele veria, o MCP vê) e custo
+    mínimo (primeiro hit vence — sem GETs extras pela categoria).
+    """
+    _add_media_doc(webapi, 905, {}, category="video", name="v.mp4")
+    webapi.requests_log.clear()
+
+    out = media.triage_media(SOURCE_ID)
+
+    assert out["query_hits"]['category:"video"'] == 1
+    assert 'category:"videos"' not in out["query_hits"]
+    assert 'category:"vídeos"' not in out["query_hits"]
+    assert out["items_total"] == 1
+
+
+def test_mtr1_grupo_inteiro_zero_gera_warning_nominal(
+    webapi: Any, fake_router: Any
+) -> None:
+    """0 em todas as variantes do grupo: warning nomeia a categoria legada.
+
+    O "image=0" silencioso da F1 não se repete: o envelope denuncia o
+    grupo inteiro (3 variantes) e aponta o censo (triage_query_discovery)
+    como fonte de verdade — filosofia M-7.
+    """
+    _add_media_doc(webapi, 910, {}, category="images", name="x.jpg")
+
+    out = media.triage_media(SOURCE_ID)
+
+    zero = [w for w in out["warnings"] if "variantes sondadas sem hits" in w]
+    texts = " | ".join(zero)
+    assert "categoria 'video'" in texts  # grupo 2 zerado (3 variantes)
+    assert "3 variantes" in texts
+    assert "categoria 'image'" not in texts  # image teve hit via variante
+
+
+def test_mtr1_teto_e_histograma_intactos_com_variantes(
+    webapi: Any, fake_router: Any
+) -> None:
+    """Docs vindos pela variante passam pelo MESMO gate/teto/histograma T-6."""
+    for i in range(3):
+        _add_media_doc(webapi, 920 + i, {"face_count": ["2"]},
+                       category="imagens", name=f"p{i}.jpg")
+
+    out = media.triage_media(SOURCE_ID)
+
+    assert out["items_total"] == 3
+    assert all("rosto" in item["signals"] for item in out["ranked_items"])
+    assert out["truncated"]["total_cap_applied"] is False
+    assert out["counters"]["field_hits"]  # histograma de nomes populated

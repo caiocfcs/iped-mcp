@@ -17,6 +17,14 @@ histograma de NOMES de campos publicado (``counters.field_hits``). O
 envelope jamais traz valores de propriedades — nomes apenas (precedente de
 privacidade do T-10).
 
+Divergência M-TR-1 (deliberada, autorizada pelo operador): o ICARO sonda
+somente as literais singulares-EN (media_strategy.py:22-23) e no jar real
+vê 0 em image/video/audio/document (matcher phrase-exato sensível a
+plural — images=38.057, F1/phase-9-runtime-ondas.md §4). A tool mantém a
+literal do ICARO como PRIMEIRA tentativa de cada grupo (paridade quando o
+rótulo existe) e acrescenta as variantes medidas em runtime — ou seja, o
+ICARO continua vendo 0 onde o MCP passa a ver o índice real.
+
 Divergências de fonte registradas no relatório da fase (D-10/D-11): o
 design §6.1/§6.3 descreve categorias acentuadas e chaves de dono
 ("Author"...) que NÃO existem na cópia real do ICARO — a fonte manda
@@ -367,25 +375,31 @@ def _accumulate_field_hits(agg: _Agg, props: dict[str, Any]) -> None:
 # --- coleta de candidatos (§0.2; caps herdados de base_strategy) ---------------
 
 
-def _collect_candidates(sid: str, scan: _Scan, budget: _Budget) -> list[int]:
-    """Executa as queries de categoria e deduplica candidatos.
+def _probe_category(
+    sid: str, scan: _Scan, budget: _Budget, variants: tuple[str, ...]
+) -> list[int]:
+    """Sonda as variantes de UMA categoria até o primeiro hit (M-TR-1).
+
+    Ordem: a literal canônica do ICARO primeiro (jars que a atendem — e o
+    próprio ICARO — enxergam exatamente o mesmo de antes), depois as
+    variantes plural/PT medidas no jar real (F1/phase-9-runtime-ondas §4).
+    Primeiro hit vence: achou, não se pagam mais GETs pela categoria.
 
     Args:
         sid: source_id resolvido.
         scan: estado da varredura (mutado; falha 500 vira ``-1`` + warning
-            nominal, M-2/M-3 — o eixo continua).
+            nominal, M-2/M-3 — o eixo continua com a variante seguinte).
         budget: orçamento de GET (mutado; cada /search conta 1).
+        variants: literais na ordem de tentativa (``knowledge``).
 
     Returns:
-        Ids únicos na ordem de descoberta com os caps por query (:2500) e
-        global (:5000) aplicados e marcados.
+        ``(ids, stopped)``: candidatos da variante vencedora (vazio quando
+        nenhuma variante produziu) e flag de corte por orçamento.
     """
-    out: list[int] = []
-    seen: set[int] = set()
-    for category in knowledge.MEDIA_CATEGORIES:
+    for category in variants:
         if not budget.allows():
             budget.exceeded = True
-            break
+            return [], True
         query = knowledge.TELEPHONY_QUERY_TEMPLATE.format(category=category)
         try:
             ids = search_ids(query, sid, hint=_SEARCH_HINT)
@@ -396,7 +410,48 @@ def _collect_candidates(sid: str, scan: _Scan, budget: _Budget) -> list[int]:
             continue
         budget.record()
         scan.query_hits[query] = len(ids)
+        if ids:
+            return ids, False
+    return [], False
+
+
+def _collect_candidates(sid: str, scan: _Scan, budget: _Budget) -> list[int]:
+    """Executa as queries de categoria e deduplica candidatos.
+
+    Cada categoria é um GRUPO de variantes ordenadas
+    (``MEDIA_CATEGORY_VARIANTS``, M-TR-1); 0-hit/falha do grupo inteiro
+    vira warning nominal nomeando as variantes tentadas (M-7 — foi o
+    "0 silencioso" que escondeu a F1 no veredito T-6).
+
+    Args:
+        sid: source_id resolvido.
+        scan: estado da varredura (mutado).
+        budget: orçamento de GET (mutado; cada /search conta 1).
+
+    Returns:
+        Ids únicos na ordem de descoberta com os caps por query (:2500) e
+        global (:5000) aplicados e marcados.
+    """
+    out: list[int] = []
+    seen: set[int] = set()
+    for variants in knowledge.MEDIA_CATEGORY_VARIANTS:
+        if not budget.allows():
+            budget.exceeded = True
+            break
+        ids, stopped = _probe_category(sid, scan, budget, variants)
+        if not ids:
+            scan.warnings.append(
+                knowledge.MEDIA_CATEGORY_ZERO_WARNING.format(
+                    category=variants[0],
+                    tried=len(variants),
+                )
+            )
+        if stopped:
+            return out
         if len(ids) > knowledge.CATEGORY_QUERY_CAP:
+            query = knowledge.TELEPHONY_QUERY_TEMPLATE.format(
+                category=variants[0]
+            )
             scan.query_caps[query] = len(ids) - knowledge.CATEGORY_QUERY_CAP
             ids = ids[: knowledge.CATEGORY_QUERY_CAP]
         for doc_id in ids:

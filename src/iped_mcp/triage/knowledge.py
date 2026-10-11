@@ -781,6 +781,50 @@ MEDIA_CATEGORIES = (
     "spreadsheet", "presentation", "archive", "whatsapp",
 )
 
+# Variantes de sonda por categoria de mídia (M-TR-1). O matcher de frase do
+# jar real é phrase-exato e sensível a plural: as literais singulares-EN do
+# ICARO (media_strategy.py:22-23 = MEDIA_CATEGORIES) deram 0 hits onde a
+# variante existe — medido na validação runtime da fase 9 (image=0 vs
+# images=38.057; videos=77; audios=230; documents=1.107; whatsapp=304 com a
+# literal; censo de 49 categorias com rótulos "other images"/"pdf
+# documents"; evidência literal em research/evidence/phase9bc/parity-t6.json
+# e research/reports/phase-9-runtime-ondas.md §3/§4-F1).
+# Regras do conjunto (decisão M-TR-1, documentada):
+# 1) só entram variantes MEDIDAS no censo do caso de referência — variantes
+#    plausíveis não medidas ficam de fora (KISS; T-10 é a fonte de verdade
+#    por caso);
+# 2) o gate do eixo (media.py:_accepted, fonte media_strategy.py:73-74) é
+#    substring: variantes cujo stem não contém a literal ("vídeos"/"áudios"
+#    acentuados) seriam fetcheadas e REJEITADAS pelo gate — uma "correção"
+#    que reeditaria a F1 por dentro. Como os raw counts do par acentuado são
+#    IDÊNTICOS aos do plural sem acento (77==77, 230==230 no parity-t6), a
+#    variante sem acento já cobre a mesma população e os acentuados ficam
+#    fora sem perda; "imagens"/"documentos" contêm o stem e passam no gate.
+# 3) a literal do ICARO é SEMPRE a 1ª tentativa (primeiro hit vence — jars
+#    que a atendem pagam exatamente o mesmo que o ICARO paga).
+# DIVERGÊNCIA do ICARO documentada em media.py (o ICARO vê 0; o MCP passa a
+# ver o índice real).
+MEDIA_CATEGORY_VARIANTS = (
+    ("image", "images", "imagens"),           # 38.057 / 38.057 (parity-t6)
+    ("video", "videos"),                      # 77 (parity-t6; "vídeos" idem)
+    ("audio", "audios"),                      # 230 (parity-t6; "áudios" idem)
+    ("document", "documents", "documentos"),  # 1.107 / 1.107 (parity-t6)
+    ("pdf", "pdf documents"),                 # rótulo do censo (F1 §4)
+    ("download", "downloads"),
+    ("spreadsheet", "spreadsheets"),
+    ("presentation", "presentations"),
+    ("archive", "archives"),                  # 0/0 no caso (parity-t6)
+    ("whatsapp",),                            # 304 com a literal (F1 §3)
+)
+
+# 0-hit do GRUPO inteiro (todas as variantes): warning nominal M-7 — nunca
+# o "0 silencioso" que escondeu a F1 no veredito T-6.
+MEDIA_CATEGORY_ZERO_WARNING = (
+    "categoria '{category}': {tried} variantes sondadas sem hits "
+    "(literal ICARO + variantes M-TR-1); rótulo real pode divergir "
+    "(censo: triage_query_discovery)"
+)
+
 # contentType que identifica chat mesmo sem categoria confiável.
 # Origem: media_strategy.py:25 (_CHAT_CTYPES).
 MEDIA_CHAT_CONTENT_TYPES = ("x-whatsapp-chat", "x-ufed-chat")
