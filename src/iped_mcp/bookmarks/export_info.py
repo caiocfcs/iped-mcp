@@ -45,8 +45,14 @@ def _fetch_doc(pair: tuple[str, int]) -> dict[str, Any]:
     entry["bookmarks"] = doc.get("bookmarks", [])
     entry["properties"] = doc.get("properties", {})
     try:
-        text, chars, capped = client.get_document_text(source, doc_id)
-        entry["text"] = {"content": text, "chars": chars, "capped": capped}
+        # TextResult (M-8) e NamedTuple de 5 campos: acesso por atributo —
+        # unpack de 3 valores estourava aqui e era engolido pelo except.
+        result = client.get_document_text(source, doc_id)
+        entry["text"] = {
+            "content": result.text,
+            "chars": result.total_chars,
+            "capped": result.capped,
+        }
     except (requests.RequestException, ValueError) as exc:
         entry["text"] = {
             "content": None,

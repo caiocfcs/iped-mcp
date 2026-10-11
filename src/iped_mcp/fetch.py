@@ -16,6 +16,7 @@ from typing import Any
 
 import requests
 
+from iped_mcp.client import TextResult
 from iped_mcp.config import WORKERS
 from iped_mcp.diagnose import diagnose_500
 from iped_mcp.errors import IpedError, ServerError
@@ -30,7 +31,7 @@ _cache: dict[tuple, tuple[float, Any]] = {}
 # de chars (evacua o mais antigo) limitam a RAM.
 _TEXT_CACHE_TTL = 300.0
 _TEXT_CACHE_MAX_CHARS = 256 * 1024 * 1024  # 256 MB
-_text_cache: dict[tuple[str, int], tuple[float, tuple[str, int, bool]]] = {}
+_text_cache: dict[tuple[str, int], tuple[float, TextResult]] = {}
 _text_cache_lock = threading.Lock()
 
 # Falha esperada das rotas roteadas: `IpedError` (taxonomia do client, já
@@ -40,8 +41,8 @@ _text_cache_lock = threading.Lock()
 _EXPECTED_FAILURES = (IpedError, ValueError, requests.RequestException)
 
 
-def text_cache_get(source_id: str, doc_id: int) -> tuple[str, int, bool] | None:
-    """(text, total_chars, capped) do cache de texto; None se ausente/expirado."""
+def text_cache_get(source_id: str, doc_id: int) -> TextResult | None:
+    """`TextResult` do cache de texto; None se ausente/expirado."""
     key = (source_id, doc_id)
     entry = _text_cache.get(key)
     if entry is None:
@@ -54,8 +55,8 @@ def text_cache_get(source_id: str, doc_id: int) -> tuple[str, int, bool] | None:
     return value
 
 
-def text_cache_set(source_id: str, doc_id: int, value: tuple[str, int, bool]) -> None:
-    """Armazena (text, total_chars, capped); evacua o mais antigo acima do teto."""
+def text_cache_set(source_id: str, doc_id: int, value: TextResult) -> None:
+    """Armazena o `TextResult`; evacua o mais antigo acima do teto."""
     key = (source_id, doc_id)
     with _text_cache_lock:
         _text_cache[key] = (time.monotonic(), value)
@@ -137,8 +138,8 @@ def get_document_props(source_id: str, doc_id: int) -> dict | None:
 
 def get_document_text_cached(
     source_id: str, doc_id: int
-) -> tuple[str, int, bool] | None:
-    """GET /docs/{id}/text → (text, total_chars, capped) com cache.
+) -> TextResult | None:
+    """GET /docs/{id}/text → `TextResult` (5 campos, M-8) com cache.
 
     None em falha permanente (doc inexistente/esgotado — retry é do client).
     """

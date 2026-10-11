@@ -230,3 +230,26 @@ def test_export_info_reexecucao_nao_sobrescreve(
     assert second["json_path"] != first["json_path"]
     with open(first["json_path"], encoding="utf-8") as fh:
         assert fh.read() == before
+
+
+def test_export_info_text_usa_contrato_real_do_client(
+    webapi: Any, fake_router: Any, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regressao FASE 8a (M-8): export_bookmark_info NAO pode degradar o texto
+    de todo doc por incompatibilidade de unpack com o TextResult de 5 campos.
+
+    O contrato do client e NamedTuple (text, total_chars, capped, status,
+    total_bytes); o artefato de cada doc deve sair com content preenchido e
+    sem chave ``error`` no bloco ``text``.
+    """
+    from tests.conftest import TEXT_BODY
+
+    monkeypatch.setattr(config, "EXPORTS_DIR", str(tmp_path))
+    webapi.bookmarks["texto-vivo"] = [{"source": SOURCE_ID, "ids": [DOC_TEXT_ID]}]
+    info = export_bookmark_info("texto-vivo", str(tmp_path), SOURCE_ID)
+    with open(info["json_path"], encoding="utf-8") as f:
+        payload = json.load(f)
+    entry = payload["docs"][0]
+    assert "error" not in entry["text"], entry["text"]
+    assert entry["text"]["content"] == TEXT_BODY.decode("utf-8")
+    assert entry["text"]["capped"] is False
