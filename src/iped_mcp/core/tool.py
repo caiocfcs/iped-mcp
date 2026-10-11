@@ -18,7 +18,7 @@ from typing import Any
 import requests
 from fastmcp import FastMCP
 
-from iped_mcp import config
+from iped_mcp import config, validation
 from iped_mcp.client import TEXT_STATUS_NO_TEXT, TEXT_STATUS_OK, TextResult
 from iped_mcp.diagnose import guarded_call
 from iped_mcp.download import (
@@ -211,8 +211,7 @@ def search(
         )
     if not query or not query.strip():
         raise ValueError("'query' não pode ser vazio.")
-    if not 1 <= limit <= 500:
-        raise ValueError("limit deve estar entre 1 e 500.")
+    validation.check_int_range(limit, "limit", 1, validation.DOCS_LIMIT_MAX)
     parts = [query.strip()]
     if extra_filters:
         parts.extend(f.strip() for f in extra_filters if f and f.strip())
@@ -311,10 +310,8 @@ def doc_text(
         max_chars: máximo de caracteres a devolver (padrão 20000, teto 100000).
         offset: caractere inicial (paginação; padrão 0).
     """
-    if not 1 <= max_chars <= 100000:
-        raise ValueError("max_chars deve estar entre 1 e 100000.")
-    if offset < 0:
-        raise ValueError("offset deve ser >= 0.")
+    validation.check_int_range(max_chars, "max_chars", 1, validation.MAX_CHARS_MAX)
+    validation.check_min(offset, "offset", 0)
     read = text_cache_get(source_id, doc_id)
     if read is None:
         # guarded_call continua traduzindo falhas reais (rede, 404, rede

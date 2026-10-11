@@ -11,7 +11,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from iped_mcp import config
+from iped_mcp import config, validation
 from iped_mcp.download import export_path, iso_utc, utc_now
 from iped_mcp.progress import op_envelope
 from iped_mcp.regex.queries import (
@@ -63,8 +63,9 @@ def regex_list_types(source_id: str, sample_size: int = 200) -> dict[str, Any]:
         source_id: source no IPED (veja iped_list_sources).
         sample_size: nº de documentos a amostrar p/ tipos desconhecidos (padrão 200, máx. 2000).
     """
-    if not 1 <= sample_size <= 2000:
-        raise ValueError("sample_size deve estar entre 1 e 2000.")
+    validation.check_int_range(
+        sample_size, "sample_size", 1, validation.REGEX_SAMPLE_SIZE_MAX
+    )
     result = discover_types(source_id, sample_size)
     return {
         "source": source_id,
@@ -138,13 +139,12 @@ def regex_top_values(
     Args:
         source_id: source no IPED (veja iped_list_sources).
         attribute: tipo sem o prefixo (ex.: "BR_CNPJ"); prefixo "Regex:" é aceito.
-        top: nº de valores a devolver (padrão 10).
+        top: nº de valores a devolver (padrão 10, teto 1000).
         offset: docs a pular antes do lote (padrão 0 = domínio inteiro).
         limit: docs no lote (omitido = até o fim); frequências e amostras
             de um lote descrevem SÓ o lote (`total_docs` é o domínio).
     """
-    if top < 1:
-        raise ValueError("top deve ser >= 1.")
+    validation.check_int_range(top, "top", 1, validation.TOP_VALUES_MAX)
     started_at = time.monotonic()
     attr = normalize_attribute(attribute)
     scan = scan_attribute(source_id, attr, offset=offset, limit=limit)
@@ -281,10 +281,11 @@ def regex_value_docs(
         source_id: source no IPED (veja iped_list_sources).
         attribute: tipo sem o prefixo (ex.: "BR_CNPJ"); prefixo "Regex:" é aceito.
         value: valor exato ou fragmento a buscar.
-        limit: máximo de documentos a detalhar (padrão 50).
+        limit: máximo de documentos a detalhar (padrão 50, teto 500).
     """
     if not value:
         raise ValueError("'value' não pode ser vazio.")
+    validation.check_int_range(limit, "limit", 1, validation.DOCS_LIMIT_MAX)
     attr = normalize_attribute(attribute)
     ids = search_ids(build_regex_query(attr, value=value), source_id)
     docs = []

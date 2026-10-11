@@ -17,18 +17,15 @@ from fastmcp import FastMCP
 from iped_mcp.bookmarks.download import _first, download_bookmark, flatten_groups
 from iped_mcp.bookmarks.export_info import export_bookmark_info
 from iped_mcp.bookmarks.idsfile import read_ids_or_hashes_file
+from iped_mcp import validation
 from iped_mcp.config import WORKERS
 from iped_mcp.diagnose import guarded_call
 from iped_mcp.lucene import quote_value
 from iped_mcp.router import get_router
 
 _DOCS_LIMIT_DEFAULT = 50
-_DOCS_LIMIT_MAX = 500
 _SAVE_SEARCH_LIMIT_DEFAULT = 200
-_SAVE_SEARCH_LIMIT_MAX = 1000
 _REPORT_LIMIT_DEFAULT = 10
-_REPORT_LIMIT_MAX = 50
-_ADD_LIMIT_MAX = 500
 
 _REPORT_TEXT_KEYS = ["audio:transcription", "dc:description", "text"]
 _SEARCH_HINT = "Confira a sintaxe da query Lucene (ou use ufed_search/regex_*)."
@@ -192,8 +189,7 @@ def bookmarks_docs(
         limit: docs por página (padrão 50, máx. 500).
         offset: posição inicial da página (padrão 0).
     """
-    if not 1 <= limit <= _DOCS_LIMIT_MAX:
-        raise ValueError(f"limit deve estar entre 1 e {_DOCS_LIMIT_MAX}.")
+    validation.check_int_range(limit, "limit", 1, validation.DOCS_LIMIT_MAX)
     if offset < 0:
         raise ValueError("offset deve ser >= 0.")
     flat = flatten_groups(get_router().get_bookmark_docs(bookmark, source_id))
@@ -241,11 +237,12 @@ def bookmarks_add(
             servidor agir.
     """
     _validate_docs(docs)
-    if len(docs) > _ADD_LIMIT_MAX:
-        raise ValueError(
-            f"{len(docs)} docs excede o teto de {_ADD_LIMIT_MAX} por chamada. "
-            "Use bookmarks_add_from_file para lotes grandes."
-        )
+    validation.check_count(
+        len(docs),
+        "docs",
+        validation.DOCS_LIMIT_MAX,
+        hint="Use bookmarks_add_from_file para lotes grandes.",
+    )
     client = get_router()
     existed = bookmark_exists(bookmark, source_id)
     client.add_to_bookmark(bookmark, docs, source_id)
@@ -274,11 +271,12 @@ def bookmarks_remove(
             servidor agir.
     """
     _validate_docs(docs)
-    if len(docs) > _ADD_LIMIT_MAX:
-        raise ValueError(
-            f"{len(docs)} docs excede o teto de {_ADD_LIMIT_MAX} por chamada. "
-            "Use bookmarks_remove_from_file para lotes grandes."
-        )
+    validation.check_count(
+        len(docs),
+        "docs",
+        validation.DOCS_LIMIT_MAX,
+        hint="Use bookmarks_remove_from_file para lotes grandes.",
+    )
     get_router().remove_from_bookmark(bookmark, docs, source_id)
     return {"sent": len(docs)}
 
@@ -355,8 +353,7 @@ def bookmarks_save_search(
         raise ValueError("'bookmark' não pode ser vazio.")
     if not query:
         raise ValueError("'query' não pode ser vazia.")
-    if not 1 <= limit <= _SAVE_SEARCH_LIMIT_MAX:
-        raise ValueError(f"limit deve estar entre 1 e {_SAVE_SEARCH_LIMIT_MAX}.")
+    validation.check_int_range(limit, "limit", 1, validation.SAVE_SEARCH_LIMIT_MAX)
     client = get_router()
     # Politica unica de erro (M-2): guard compartilhado; 500 → diagnose com a
     # query montada; rede/timeout/404 → textos estáveis de iped_mcp.errors.
@@ -401,8 +398,7 @@ def bookmarks_report(
             servidor agir.
         limit: nº de docs a amostrar (padrão 10, máx. 50).
     """
-    if not 1 <= limit <= _REPORT_LIMIT_MAX:
-        raise ValueError(f"limit deve estar entre 1 e {_REPORT_LIMIT_MAX}.")
+    validation.check_int_range(limit, "limit", 1, validation.REPORT_LIMIT_MAX)
     flat = flatten_groups(get_router().get_bookmark_docs(bookmark, source_id))
     total = len(flat)
     docs: list[dict[str, Any]] = []
@@ -493,7 +489,7 @@ def bookmarks_download_info(bookmark: str, dest_dir: str, source_id: str) -> dic
 def bookmarks_create_from_file(name: str, path: str, source: str) -> dict[str, Any]:
     """Cria um bookmark e adiciona os docs de um arquivo txt (1 ID ou MD5 por linha).
 
-    Cada linha é um doc ID (só dígitos) ou um hash MD5 (32 hex); os MD5 são
+    Cada linha é um doc ID (só dígitos) ou um hash MD5 (32 hex, ou o prefixo explícito "md5:"); os MD5 são
     resolvidos para doc IDs via busca no source (um MD5 pode casar com vários
     docs). O path é resolvido na máquina onde o MCP roda. Se o bookmark já
     existe, erroa (use bookmarks_add_from_file para adicionar sem mesclar).
@@ -511,6 +507,9 @@ def bookmarks_create_from_file(name: str, path: str, source: str) -> dict[str, A
     ids, md5s, invalid = read_ids_or_hashes_file(path)
     if not ids and not md5s:
         raise ValueError(f"Nenhum ID ou MD5 válido no arquivo '{path}'.")
+    validation.check_count(
+        len(ids) + len(md5s), "ids/md5 no arquivo", validation.FILE_IDS_MAX
+    )
     if bookmark_exists(name, source):
         raise ValueError(
             f"Bookmark '{name}' já existe. Use bookmarks_add_from_file para "
@@ -518,6 +517,9 @@ def bookmarks_create_from_file(name: str, path: str, source: str) -> dict[str, A
         )
     resolved, not_found, failures = _resolve_md5s(md5s, source)
     all_ids = _dedupe(ids + resolved)
+    validation.check_count(
+        len(all_ids), "docs resolvidos do arquivo", validation.FILE_IDS_MAX
+    )
     if not all_ids:
         raise ValueError(
             f"Nenhum doc encontrado no arquivo '{path}': os {len(md5s)} MD5 "
@@ -548,7 +550,7 @@ def bookmarks_create_from_file(name: str, path: str, source: str) -> dict[str, A
 def bookmarks_add_from_file(bookmark: str, path: str, source: str) -> dict[str, Any]:
     """Adiciona a um bookmark os docs de um arquivo txt (1 ID ou MD5 por linha).
 
-    Cada linha é um doc ID (só dígitos) ou um hash MD5 (32 hex); os MD5 são
+    Cada linha é um doc ID (só dígitos) ou um hash MD5 (32 hex, ou o prefixo explícito "md5:"); os MD5 são
     resolvidos para doc IDs via busca no source. O path é resolvido na máquina
     onde o MCP roda. `sent` = docs enviados; o IPED ignora silenciosamente
     docs inexistentes (IDs).
@@ -563,8 +565,14 @@ def bookmarks_add_from_file(bookmark: str, path: str, source: str) -> dict[str, 
     ids, md5s, invalid = read_ids_or_hashes_file(path)
     if not ids and not md5s:
         raise ValueError(f"Nenhum ID ou MD5 válido no arquivo '{path}'.")
+    validation.check_count(
+        len(ids) + len(md5s), "ids/md5 no arquivo", validation.FILE_IDS_MAX
+    )
     resolved, not_found, failures = _resolve_md5s(md5s, source)
     all_ids = _dedupe(ids + resolved)
+    validation.check_count(
+        len(all_ids), "docs resolvidos do arquivo", validation.FILE_IDS_MAX
+    )
     client = get_router()
     existed = bookmark_exists(bookmark, source)
     client.add_to_bookmark(bookmark, [{"source": source, "id": i} for i in all_ids], source)
@@ -597,7 +605,7 @@ def bookmarks_add_from_file(bookmark: str, path: str, source: str) -> dict[str, 
 def bookmarks_remove_from_file(bookmark: str, path: str, source: str) -> dict[str, Any]:
     """Remove de um bookmark os docs de um arquivo txt (1 ID ou MD5 por linha).
 
-    Cada linha é um doc ID (só dígitos) ou um hash MD5 (32 hex); os MD5 são
+    Cada linha é um doc ID (só dígitos) ou um hash MD5 (32 hex, ou o prefixo explícito "md5:"); os MD5 são
     resolvidos para doc IDs via busca no source. O path é resolvido na máquina
     onde o MCP roda. `sent` = docs enviados; o IPED ignora silenciosamente
     docs inexistentes (IDs).
@@ -612,8 +620,14 @@ def bookmarks_remove_from_file(bookmark: str, path: str, source: str) -> dict[st
     ids, md5s, invalid = read_ids_or_hashes_file(path)
     if not ids and not md5s:
         raise ValueError(f"Nenhum ID ou MD5 válido no arquivo '{path}'.")
+    validation.check_count(
+        len(ids) + len(md5s), "ids/md5 no arquivo", validation.FILE_IDS_MAX
+    )
     resolved, not_found, failures = _resolve_md5s(md5s, source)
     all_ids = _dedupe(ids + resolved)
+    validation.check_count(
+        len(all_ids), "docs resolvidos do arquivo", validation.FILE_IDS_MAX
+    )
     get_router().remove_from_bookmark(
         bookmark, [{"source": source, "id": i} for i in all_ids], source
     )

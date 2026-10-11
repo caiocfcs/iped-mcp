@@ -1,7 +1,8 @@
 """Politica unica de erro HTTP (M-2 / DESIGN 02).
 
 Camadas cobertas: client (traducao na fronteira), router (ValueError
-estavel centrado em source; ServerError de search fica tipado) e tool
+estavel centrado em source, sem vazamento de excecoes tipadas desde a
+revogacao M-14 do caso especial de search) e tool
 (list_sources reporta falha como DADO). Tradugoes de transporte usadas
 aqui sao injetadas via monkeypatch; os casos de status (404/500) usam o
 fake da 2d real. Nenhum acesso a rede externa (AC5/AC6 do Design 01).
@@ -141,15 +142,18 @@ def test_router_timeout_source_keeps_timeout_prefix(
     assert str(exc.value) == TIMEOUT_EXACT
 
 
-def test_router_search_500_stays_typed_for_immediate_diagnose(
+def test_router_search_500_follows_standard_m2_flow(
     fake_router: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ServerError em search NAO vira ValueError: fetch/guarded_call diagnosticam
-    o 500 de query na hora, sem retry do loop transient-only (comportamento pre-M-2)."""
+    """Revogacao M-14: sem caso especial no router, o 500 de search vira o
+    ValueError padrao M-2 com o texto traduzido do proprio erro. O nao-retry
+    de 5xx em busca e garantido pela politica de classe do client (M-3),
+    pinado em test_resilience.py — nao pelo vazamento da classe tipada."""
     boom = errors.ServerError("HTTP 500 traduzido", status_code=500)
     monkeypatch.setattr(fake_router._clients["default"], "search", _raise_for(boom))
-    with pytest.raises(errors.ServerError):
+    with pytest.raises(ValueError, match="HTTP 500") as exc:
         fake_router.search("*", source_id=SOURCE_ID)
+    assert not isinstance(exc.value, errors.IpedError)
 
 
 def test_unknown_source_when_online_is_not_found(fake_router: Any) -> None:

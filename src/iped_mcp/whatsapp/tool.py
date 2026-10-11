@@ -19,7 +19,7 @@ from typing import Any
 import requests
 from fastmcp import FastMCP
 
-from iped_mcp import config
+from iped_mcp import config, validation
 from iped_mcp.client import TEXT_STATUS_NO_TEXT
 from iped_mcp.config import WORKERS
 from iped_mcp.download import export_path, iso_utc, utc_now
@@ -361,8 +361,9 @@ def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
 
     Args:
         source_id: source no IPED (veja iped_list_sources).
-        top: nº de conversas/interlocutores a devolver (padrão 10).
+        top: nº de conversas/interlocutores a devolver (padrão 10, teto 1000).
     """
+    validation.check_int_range(top, "top", 1, validation.TOP_VALUES_MAX)
     started_at = time.monotonic()
     if top < 1:
         raise ValueError("top deve ser >= 1.")
@@ -807,8 +808,7 @@ def whatsapp_export_conversation(
         overwrite: True permite reescrever o MESMO JSON na reexecução
             (default False: nome único com timestamp UTC, sem sobrescrita).
     """
-    if not 1 <= limit <= 500:
-        raise ValueError("limit deve estar entre 1 e 500.")
+    validation.check_int_range(limit, "limit", 1, validation.DOCS_LIMIT_MAX)
     started_at = time.monotonic()
     num = _require_number(number)
     window = _export_window(start, end)

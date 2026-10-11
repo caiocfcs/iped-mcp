@@ -89,13 +89,16 @@ def search_ids(
     Uma única chamada: o retry de falha transitória (conexão/timeout) é do
     client (M-3) e chega aqui já traduzido pelo router em ValueError com
     texto estável ("Source 'x' indisponível"). HTTP 500 no /search = query
-    rejeitada (determinística): falha NA HORA com o diagnóstico, sem
-    esperar tentativas (AC4 — semântica pré-M-3 preservada).
+    rejeitada (determinística): o client não re-tenta 5xx de busca (M-3
+    decide por classe) e o erro chega aqui como ValueError padrão M-2 — o
+    passe-through tipado do router foi revogado no M-14 (AC4 preservado:
+    o pino de não-retry do M-3 continua verde).
 
     Args:
         query: query Lucene.
         source_id: source roteada.
-        hint: frase final do diagnóstico de 500 (contexto da tool).
+        hint: frase final do diagnóstico de 500 (contexto da tool); vale
+            apenas no ramo defensivo `ServerError` abaixo.
         timeout: timeout desta chamada.
 
     Returns:
@@ -108,6 +111,9 @@ def search_ids(
     try:
         results = client.search(query, source_id=source_id, timeout=timeout)
     except ServerError as exc:
+        # Defensivo (M-14): o router não volta mais a vaziar a classe no
+        # fluxo roteado; o ramo preserva o diagnóstico de query com hint
+        # para um IPEDClient cru usado diretamente.
         raise ValueError(diagnose_500(query, hint)) from exc
     except IpedError as exc:
         # Defensivo: no fluxo roteado o router já converteu em ValueError.

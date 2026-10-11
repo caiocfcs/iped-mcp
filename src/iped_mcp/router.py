@@ -34,7 +34,6 @@ from iped_mcp.errors import (
     IpedError,
     IpedTimeoutError,
     ResourceNotFoundError,
-    ServerError,
     no_endpoint_online_message,
     source_not_found_message,
     source_unavailable_message,
@@ -297,9 +296,10 @@ class Router:
         texto estável centrado em source (o agente nunca vê endpoint nem
         exceção de transporte).
 
-        `ServerError` em `search` é re-lançado tipado: os consumidores de
-        busca (`fetch.search_ids`; tools via `guarded_call`) diagnosticam o
-        500 de query na hora, sem retry — comportamento anterior ao M-2.
+        Sem exceções tipadas vazando (M-14): o caso especial que devolvia
+        `ServerError` de `search` foi revogado — a política de retry do M-3
+        já decide por classe (5xx de busca nunca é re-tentado no client),
+        então todo erro IPED segue o fluxo padrão M-2 acima.
         """
         client = self.resolve(sid)
         try:
@@ -312,10 +312,6 @@ class Router:
             if method_name in _DOC_METHODS:
                 raise ValueError(str(exc)) from exc
             raise ValueError(source_not_found_message(sid)) from exc
-        except ServerError as exc:
-            if method_name == "search":
-                raise
-            raise ValueError(str(exc)) from exc
         except IpedError as exc:
             raise ValueError(str(exc)) from exc
 

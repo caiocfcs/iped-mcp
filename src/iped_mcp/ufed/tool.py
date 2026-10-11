@@ -6,6 +6,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from iped_mcp import validation
 from iped_mcp.diagnose import guarded_call
 from iped_mcp.fetch import cache_get, cache_set, fetch_docs_parallel, search_ids
 from iped_mcp.router import get_router
@@ -23,14 +24,11 @@ _UFED_HINT = (
     "Use ufed_list_fields(source_id=...) para ver os campos conhecidos e os "
     "observados em amostra deste source."
 )
-_LIMIT_MAX = 500
 # Match-all da amostra é cara (~47-66 s no source de teste; regex/scan.py:16);
 # mesmo timeout das demais match-all do projeto (regex/scan.py:17, core 120 s).
 _MATCH_ALL_QUERY = "*"
 _MATCH_ALL_TIMEOUT = 120.0
 _DEFAULT_SAMPLE_SIZE = 10
-_MIN_SAMPLE_SIZE = 1
-_MAX_SAMPLE_SIZE = 200
 
 
 def _first(value: object) -> object:
@@ -79,8 +77,7 @@ def ufed_search(
     advisory = field_advisory(attr)
     if advisory is not None:
         warnings.append(advisory)
-    if not 1 <= limit <= _LIMIT_MAX:
-        raise ValueError(f"limit deve estar entre 1 e {_LIMIT_MAX}.")
+    validation.check_int_range(limit, "limit", 1, validation.DOCS_LIMIT_MAX)
     query = build_ufed_query(attr, value=value, values=values, extra_filters=extra_filters)
     client = get_router()
     # Politica unica de erro (M-2): guard compartilhado; 500 → diagnose com a
@@ -235,10 +232,9 @@ def ufed_list_fields(
     observed: list[str] = []
     sampled = 0
     if source_id is not None:
-        if not _MIN_SAMPLE_SIZE <= sample_size <= _MAX_SAMPLE_SIZE:
-            raise ValueError(
-                f"sample_size deve estar entre {_MIN_SAMPLE_SIZE} e {_MAX_SAMPLE_SIZE}."
-            )
+        validation.check_int_range(
+            sample_size, "sample_size", 1, validation.FIELD_SAMPLE_SIZE_MAX
+        )
         observed, sampled = _observed_fields_sample(source_id, sample_size)
         if sampled == 0:
             warnings.append(
