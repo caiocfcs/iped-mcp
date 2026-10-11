@@ -498,3 +498,270 @@ HTTP_BUDGET_WARNING_TEMPLATE = (
     "http_budget_exceeded: varredura interrompida em {calls} GETs "
     "(cap {cap}); resultados PARCIAIS — {omitted}"
 )
+
+# --- T-4 financeiro: categorias, termos e detectores (DESIGN 09-B §4.2/§4.3) -
+
+# Categorias do eixo financeiro (PT-BR + EN; matching por substring
+# case-insensitive da categoria no gate).
+# Origem: iped-icaro/strategies/financial_strategy.py:32-35 (13 categorias).
+FINANCIAL_CATEGORIES = (
+    "documents", "imagens", "pdf", "spreadsheets", "chats", "messages",
+    "emails", "documentos", "planilhas", "mensagens", "images", "pictures",
+    "fotos",
+)
+
+# Categorias de cartão: passam direto no gate, sem termo financeiro.
+# Origem: financial_strategy.py:38.
+FINANCIAL_CARD_CATEGORIES = (
+    "mobile cards", "credit cards", "transfers of funds", "locations",
+)
+
+# Marcador de conta/ativo financeiro: substring de categoria que casa o
+# singular e o plural. Origem: financial_strategy.py:47-49; o gate do
+# plural (ativo) usa a variante explícita :122-128.
+FINANCIAL_ACCOUNT_MARKER = "financial account"
+FINANCIAL_ACCOUNT_PLURAL_MARKER = "financial accounts"
+
+# Queries de coleta do eixo: 13 categorias + 4 de cartão + o marcador de
+# conta. Origem: DESIGN 09-B §2.2 (18 queries de categoria; +4 probes
+# Regex §4.3 = ~22 GET de /search do orçamento 5100).
+FINANCIAL_QUERY_CATEGORIES = (
+    *FINANCIAL_CATEGORIES,
+    *FINANCIAL_CARD_CATEGORIES,
+    FINANCIAL_ACCOUNT_MARKER,
+)
+FINANCIAL_QUERY_TEMPLATE = TELEPHONY_QUERY_TEMPLATE  # mesma forma category:"X"
+
+# Termos financeiros no nome/path (minúsculos). O "transferencia" SEM
+# acento é o literal do ICARO — "transferência" NUNCA casa: quirk fiel
+# pinnado em teste. Origem: financial_strategy.py:56.
+FINANCIAL_TERMS = (
+    "comprovante", "pix", "extrato", "boleto", "transferencia", "pagamento",
+    "nota fiscal",
+)
+
+# Mídia sem termo no nome é descartada MESMO com Regex:MONEY (anti-ruído;
+# substring do nome minúsculo). Origem: financial_strategy.py:59-63.
+FINANCIAL_MEDIA_EXTS = (".svg", ".tmp", ".heic", ".jpg", ".jpeg", ".png", ".gif")
+
+# Detectores Regex sondados POR CASO antes de confiar (a lista é o consumo
+# real do ICARO, não o catálogo local KNOWN_TYPES — BR_BOLETO e CREDIT_CARD
+# não estão em regex/queries.py:11-21). Origem: financial_strategy.py:168-170
+# + DESIGN 09-B §4.3. A sonda CREDIT_CARD é INFORMATIVA (painel): o
+# extrator de cartões usa categorias+campos ufed (:243-334), nunca a prop.
+FINANCIAL_REGEX_PROBES = ("MONEY", "BR_BOLETO", "BR_BANK_ACCOUNT", "CREDIT_CARD")
+FINANCIAL_REGEX_UNAVAILABLE_WARNING = (
+    "detectorRegex:{name} indisponível neste caso (0 hits)"
+)
+# Gate regex de classificação: SOMENTE MONEY/BR_BOLETO (:57 — o
+# BR_BANK_ACCOUNT NÃO liga o gate; quirk fiel).
+FINANCIAL_GATE_REGEX_FIELDS = ("Regex:MONEY", "Regex:BR_BOLETO")
+
+# --- T-4 financeiro: campos de propriedades (DESIGN 09-B §4.4) ----------------
+
+# Propriedades dos detectores nas evidências. Origem: financial_strategy.py:168-170.
+FINANCIAL_REGEX_MONEY_FIELD = "Regex:MONEY"
+FINANCIAL_REGEX_BOLETO_FIELD = "Regex:BR_BOLETO"
+FINANCIAL_REGEX_BANK_FIELD = "Regex:BR_BANK_ACCOUNT"
+
+# Escada method/amount da evidência. Origem: financial_strategy.py:183-197.
+FIN_METHOD_MONEY = "Dinheiro/Valor Encontrado"      # :185
+FIN_AMOUNT_BOLETO = "Boleto Bancário"               # :187
+FIN_METHOD_BOLETO = "Boleto"                        # :188
+FIN_AMOUNT_UNIDENTIFIED = "Valor não identificado"  # :190 (também pino de score :886)
+FIN_METHOD_ACCOUNT = "Comprovante/Conta"            # :191
+FIN_BENEFICIARY_UNKNOWN = "N/I"                     # :197
+
+# Parser BR de valores (_parse_amount_to_float :206-241): sentinela -1.0,
+# regex de números, marcadores não-numéricos e regra do ponto de milhar
+# (último bloco de exatamente 3 dígitos). Origens nas linhas citadas.
+AMOUNT_NUMBER_RE = r"([\d\.\,]+)"                    # :218
+AMOUNT_SENTINEL = -1.0                               # :209/:214/:220/:241
+AMOUNT_UNPARSEABLE_MARKERS = ("Valor não identificado", "Boleto")  # :213
+AMOUNT_THOUSANDS_BLOCK = 3                           # :232-236
+
+# Cartões (:243-334). Marcadores de categoria :260/:273; chaves de indexação
+# p/ jumpTargets por ufed:id[0] e sufixo-UUID do nome :244-252.
+CARD_CREDIT_MARKERS = ("credit card", "creditcard")  # :260
+CARD_MOBILE_MARKERS = ("mobile card", "mobilecard")  # :273
+CARD_ID_FIELD = "ufed:id"                            # :247-249
+CARD_NAME_UUID_SEP = "_"                             # :251-252
+CARD_NUMBER_FIELD = "ufed:CreditCardNumber"          # :261
+CARD_COMPANY_FIELD = "ufed:Company"                  # :265-266
+CARD_EXPIRATION_FIELD = "ufed:ExpirationDate"        # :268
+CARD_DESCRIPTION_FIELD = "ufed:Description"          # :274
+CARD_ORGANIZATION_FIELD = "ufed:Organization"        # :279
+CARD_PURCHASE_TIME_FIELD = "ufed:PurchaseTime"       # :280
+CARD_WALLET_FIELD = UFED_SOURCE_FIELD                # :269/:281 ("ufed:Source")
+CARD_UNKNOWN_KEY = "unknown"                         # :262/:275 (chave default)
+CARD_JUMPS_FIELD = "ufed:jumpTargets"                # :288
+CARD_JUMP_TX_MARKERS = ("transfer", "fund")          # :300
+CARD_JUMP_LOCATION_MARKER = "location"               # :317
+CARD_TX_AMOUNT_FIELD = "ufed:Amount"                 # :302-304
+CARD_TX_AMOUNT_DEFAULT = "0"                         # :303 (default do parse)
+CARD_TX_CURRENCY_FIELD = "ufed:Currency"             # :305
+CARD_TX_DATE_FIELD = "ufed:DateProcessed"            # :306
+CARD_TX_STATUS_FIELD = "ufed:Status"                 # :307
+CARD_TX_TYPE_FIELD = "ufed:TransferType"             # :308
+CARD_TX_PAYEE_FIELD = "Communication:To"             # :309
+CARD_TX_PAYER_FIELD = "Communication:From"           # :310
+CARD_GEO_FIELD = "common:geo:locations"              # :318 (= GEO_LOCATION_FIELD T-5)
+CARD_GEO_RE = r"(-?\d+\.\d+)[;,\s]+(-?\d+\.\d+)"     # :320
+CARD_GEO_TYPE = "Mobile Payment"                     # :325
+CARD_TIMESTAMP_FIELD = "ufed:TimeStamp"              # :326
+
+# Contas/ativos (:106-159). UUID da conta-pai no path do ativo :21; conta de
+# nuvem pelo e-mail no path .ufdr :22; contentType markers :126-136.
+ACCOUNT_UUID_IN_PATH_RE = r"FinancialAccount_([0-9a-fA-F-]{36})"   # :21
+EMAIL_IN_PATH_RE = r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+)\.ufdr"     # :22
+ASSET_CONTENT_MARKER = "financialasset"              # :126-128
+ACCOUNT_CONTENT_MARKER = "financialaccount"          # :135-136
+ASSET_CURRENCY_FIELD = "ufed:Currency"               # :132
+# Campos da conta na saída (chave de saída -> campo ufed). Origem :141-150.
+ACCOUNT_OUTPUT_FIELDS = (
+    ("account_id", "ufed:AccountID"),            # :143
+    ("account_type", "ufed:FinancialAccountType"),  # :144
+    ("found_in_type", "ufed:FoundInModelType"),  # :145
+    ("found_in_field", "ufed:FoundInField"),     # :146
+    ("source", "ufed:Source"),                   # :147
+    ("is_related", "ufed:isrelated"),            # :148
+    ("decoding_confidence", "ufed:decoding_confidence"),  # :149
+)
+
+# --- T-4 financeiro: scoring dos achados (DESIGN 09-B §4.5) -------------------
+
+# Handler _finding_from_financial_evidence draft_report_iped_manager.py:885-896.
+FIN_EVIDENCE_SCORE_WITH_AMOUNT = 75  # :886 (amount presente e != unidentificado)
+FIN_EVIDENCE_SCORE_NO_AMOUNT = 55    # :886
+FIN_EVIDENCE_PIX_MARKER = "PIX"      # :887 ("PIX" em method.upper() -> ALTA)
+# Handler _finding_from_card :900-911.
+CARD_SCORE_BASE = 60                 # :901 min(60 + tx*2, 95)
+CARD_SCORE_PER_TX = 2                # :901
+CARD_SCORE_CAP = 95                  # :901
+CARD_RELEVANCE_ALTA_MIN_SCORE = 85   # :905 (>=85 ALTA senão MÉDIA — sem BAIXA no handler)
+# Conta financeira: SEM handler dedicado no ICARO (cai no generic :963-965
+# score 30). RECOMMENDATION DESIGN 09-B §4.5: score fixo igual ao item
+# financeiro estruturado (financial_strategy.py:72) e relevância pelas
+# bordas do handler genérico (draft_report:965).
+FIN_ACCOUNT_SCORE = 90               # == SCORE_FIN_ITEM de conta :72
+RELEVANCE_ALTA_MIN_SCORE = 85        # genérico :965 (>= 85 ALTA)
+RELEVANCE_MEDIA_MIN_SCORE = 60       # genérico :965 (>= 60 MÉDIA)
+
+# Templates literais dos achados (preservados para correlação de relatório).
+FIN_EVIDENCE_ENTITY_TEMPLATE = "{method} — {beneficiary}"                 # :890
+FIN_EVIDENCE_JUSTIFICATION_TEMPLATE = "Valor: {amount} | Método: {method}"  # :893
+FIN_EVIDENCE_SOURCE_FALLBACK = "Financeiro"    # :894 (sem arquivo resolvido)
+FIN_EVIDENCE_LOCAL_PATH_FIELD = "ufed:local_path"  # fallback da label :688-690
+CARD_ENTITY_TEMPLATE = "{card_type}: {label}"  # :902 (label = descricao ou mascarado)
+CARD_JUSTIFICATION_TEMPLATE = "{count} transações | Total: R$ {total:,.2f}"  # :907
+CARD_WALLET_FALLBACK = "Carteira digital"      # :908
+
+# Tetos de entrega (§4.6; o ICARO ordena evidências SEM teto :201 — o teto
+# MCP é sempre marcado em truncated com omissão contada).
+FINANCIAL_LIST_TOP = 30               # evidences[:30] e accounts[:30] (§4.6)
+CARD_TRANSACTIONS_SAMPLE = 5          # "últimas 5 transações resumidas" (§4.6)
+
+# Boost 95 por ranking.high (:73-76) NÃO portado: YAML externo ausente
+# (mesma decisão §3.2 do boost de identidade — nada é inventado).
+
+# Caso sem eixo financeiro: triagem vazia explícita, não exceção (§0.1;
+# espelha base_strategy.py:71-73 — StrategyResult vazio).
+FINANCIAL_EMPTY_MESSAGE = (
+    "nenhum documento do eixo financeiro (categorias de arquivo, cartões, "
+    "contas/ativos) com evidência financeira neste source"
+)
+
+# --- T-5 geolocalização: probes, campos e clusters (DESIGN 09-B §5) -----------
+
+# Campo de coordenadas consolidado do ICARO.
+# Origem: geolocation_strategy.py:26 (GEO_LOCATION_FIELD).
+GEO_LOCATION_FIELD = "common:geo:locations"
+
+# Probes ORDENADAS de coleta (§5.1 — o ICARO não filtra categoria: a coleta
+# vinha do YAML de targets, ausente; a primeira é o campo fallback do
+# ICARO, as demais são variantes de categoria PROVÁVEIS, HYPOTHESIS
+# TO_VERIFY-B2 — nenhuma lista fechada, cada 0-hit/falha vira warning).
+# Forma canônica com escape do campo (P5/M-13); template category: T-1.
+GEO_FIELD_PROBE = "common\\:geo\\:locations:*"
+GEO_CATEGORY_PROBES = (
+    "locations", "location", "gps", "geolocation", "exif",
+)
+GEO_PROBE_QUERIES = (
+    GEO_FIELD_PROBE,
+    *(TELEPHONY_QUERY_TEMPLATE.format(category=cat) for cat in GEO_CATEGORY_PROBES),
+)
+GEO_PROBE_ZERO_WARNING = (
+    "sonda geoespacial '{query}' sem hits (cobertura limitada às probes "
+    "listadas — docs geo em categorias não sondadas podem não aparecer)"
+)
+
+# Gate por props (a VERDADE do eixo): QUALQUER chave contendo um destes
+# marcadores (case-insensitive). Origem: geolocation_strategy.py:215-221.
+GEO_GATE_KEY_MARKERS = ("latitude", "longitude", "geo:location")
+
+# Campos de timestamp na ordem literal do ICARO. Origem: :29-35.
+GEO_TIMESTAMP_FIELDS = (
+    "ufed:TimeStamp", "ufed:StartTime", "timeStamp", "created", "modified",
+)
+
+# Padrão "lat,lon" em texto (também ';' e espaço). Origem: :37-39.
+GEO_COORDINATE_RE = r"(-?\d+(?:\.\d+)?)[;,\s]+(-?\d+(?:\.\d+)?)"
+
+# Bounds geográficos. Origem: :82-83.
+GEO_LAT_MIN, GEO_LAT_MAX = -90.0, 90.0
+GEO_LON_MIN, GEO_LON_MAX = -180.0, 180.0
+
+# Null Island: (0,0) é placeholder de falha de leitura de GPS, não
+# localização. O ICARO descarta 0,0 exato (:86-88); o design 09 §1 T-5
+# alarga para |lat|<=1e-4 E |lon|<=1e-4 (coordenadas mínimas de placeholder
+# continuando descartadas; 0.0002 NÃO é descartada — pino de teste).
+NULL_ISLAND_EPS = 0.0001  # origem: :86-88 (aditamento DESIGN 09-B §5.2)
+
+# Agrupamento por 4 casas decimais (~11 m). Origem: :90-94.
+GEO_CLUSTER_DECIMALS = 4
+
+# Tipo de fonte por substring da categoria (ordem do elif chain).
+# Origem: geolocation_strategy.py:165-172; GEO_METADATA é o rótulo do
+# campo geo:location no design §5.2 (senão, a categoria crua).
+GEO_SOURCE_TYPE_BY_CATEGORY = (
+    (("image", "photo", "video"), "EXIF"),       # :165-166
+    (("chat", "message", "mensagens"), "CHAT"),  # :167-168
+    (("wifi",), "WIFI"),                         # :169-170
+    (("cell", "torre"), "CELL_TOWER"),           # :171-172
+)
+GEO_TYPE_GEO_METADATA = "GEO_METADATA"   # :174 (fallback do chain do ICARO)
+GEO_TYPE_NO_CATEGORY = "sem_categoria"   # MCP: categoria crua vazia (§5.2)
+
+# --- T-5 geolocalização: scoring do achado (DESIGN 09-B §5.2) -----------------
+
+# Handler _finding_from_geolocation draft_report_iped_manager.py:932-947
+# (a PONTUAÇÃO DO ACHADO é a do handler; a strategy usa score fixo 80 no
+# item :54 — não portado porque o achado é o que sai).
+GEO_SCORE_BASE = 50            # :933 min(50 + count*5, 95)
+GEO_SCORE_PER_EVIDENCE = 5     # :933
+GEO_SCORE_CAP = 95             # :933
+# Limiares ESTRITOS (contagem exata 3 NÃO é MÉDIA; 11 é ALTA). Origem :934.
+GEO_RELEVANCE_ALTA_COUNT = 10
+GEO_RELEVANCE_MEDIA_COUNT = 3
+# Justificação do design §5.2 (primeiro/último período lexicográficos,
+# "N/I" quando ausente — :147/:149).
+GEO_JUSTIFICATION_TEMPLATE = (
+    "Coordenadas: {lat:.5f}, {lon:.5f} | Ocorrências: {count} | "
+    "Período: {first} até {last}"
+)
+GEO_NOT_IDENTIFIED_TIMESTAMP = "N/I"  # origem: :147/:149
+GEO_POINTS_TOP = 100                  # points[:100] marcado (§5.4)
+
+# SEM enriquecimento de país: CoordinatesToCountryTool é ICARO-side/externa
+# (rede/ML — fora do contrato WebAPI do iped-mcp, DESIGN 09-B §5.3).
+# Campos country/state/city simplesmente NÃO aparecem: ausente ≠ falso.
+
+# Caso sem geolocalização: triagem vazia explícita, não exceção (§0.1).
+GEO_EMPTY_MESSAGE = (
+    "nenhuma coordenada geográfica válida (fora de bounds e não-Null Island) "
+    "nas probes de geolocalização deste source"
+)
+
+# Justificação da conta financeira: o ICARO não tem handler dedicado (cai no
+# generic :973-983); texto MCP documentado em DESIGN 09-B §4.5.
+FIN_ACCOUNT_JUSTIFICATION = "Conta financeira estruturada (FinancialAccount)"

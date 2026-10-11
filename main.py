@@ -46,7 +46,7 @@ mcp = FastMCP(
         "whatsapp_reference documenta os campos e queries canônicas validados. "
         "A família triage_ traz triagem pronta sem LLM: triage_telephony agrega "
         "chamadas/contatos por número e devolve o top contatos com score e "
-        "relevância (tetos e truncamento sempre marcados na resposta); triage_identity traz a identidade principal (contas, e-mails, telefones, SIM/Wi-Fi/Bluetooth, device_info padronizado, agenda) com score por confiança mais os dispositivos reconhecidos pela conta de nuvem; transcripts_generate grava o arquivo de transcrições de áudio (metadado audio:transcription) no disco de exports e devolve metadados + preview \" o texto completo nunca vai na resposta\""
+        "relevância (tetos e truncamento sempre marcados na resposta); triage_identity traz a identidade principal (contas, e-mails, telefones, SIM/Wi-Fi/Bluetooth, device_info padronizado, agenda) com score por confiança mais os dispositivos reconhecidos pela conta de nuvem; triage_financial extrai evidências financeiras (valores/PIX/contas por detectores Regex), cartões com transações agregadas e contas financeiras com score e relevância; triage_geolocation agrupa coordenadas GPS em clusters com ocorrências, período e relevância (Null Island descartada; sem país — ferramenta externa ao contrato); transcripts_generate grava o arquivo de transcrições de áudio (metadado audio:transcription) no disco de exports e devolve metadados + preview \" o texto completo nunca vai na resposta\""
     ),
 )
 
@@ -59,6 +59,11 @@ register_triage(mcp)
 
 
 def main() -> None:
+    """Ponto de entrada do servidor: roteador, logging e execução do FastMCP.
+
+    Returns:
+        Nada.
+    """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     try:
         get_router()
