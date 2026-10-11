@@ -765,3 +765,124 @@ GEO_EMPTY_MESSAGE = (
 # Justificação da conta financeira: o ICARO não tem handler dedicado (cai no
 # generic :973-983); texto MCP documentado em DESIGN 09-B §4.5.
 FIN_ACCOUNT_JUSTIFICATION = "Conta financeira estruturada (FinancialAccount)"
+
+# --- T-6 mídia: categorias, sinais e tetos (DESIGN 09-B §6) --------------------
+
+# Categorias aceitas no eixo mídia (substring da categoria minúscula; o gate
+# original é ``any(h in cat for h in _CAT_HINTS)``, media_strategy.py:73-74).
+# Origem: iped-icaro/strategies/media_strategy.py:22-23 (_CAT_HINTS, 10
+# entradas). DIVERGÊNCIA DO DESIGN: o §6.1 lista "11 entradas" acentuadas
+# (fotos/vídeos/áudios/pictures/audio-video) — a cópia real do ICARO contém
+# EXATAMENTE estas 10; variantes não portadas (registro D-10 no relatório da
+# fase; regra de evidência: a fonte manda).
+MEDIA_CATEGORIES = (
+    "image", "video", "audio", "document", "pdf", "download",
+    "spreadsheet", "presentation", "archive", "whatsapp",
+)
+
+# contentType que identifica chat mesmo sem categoria confiável.
+# Origem: media_strategy.py:25 (_CHAT_CTYPES).
+MEDIA_CHAT_CONTENT_TYPES = ("x-whatsapp-chat", "x-ufed-chat")
+
+# 12 preditores de sinal: (nome, campos candidatos, pontos, avaliador).
+# Origem: media_strategy.py:28-46 (_SIGNALS, pontos e rótulos literais).
+# O 4º elemento escolhe o predicado em triage/media.py (dados em knowledge,
+# predicados em código — separação de responsabilidades); o par (campo,
+# ponto) é o literal da fonte. "nudez" usa >=2 e não >0 (:31, quirk pinado).
+MEDIA_SIGNALS = (
+    ("OCR", ("ocrCharCount",), 15, "num_positive"),            # :29
+    ("rosto", ("face_count",), 10, "num_positive"),            # :30
+    ("nudez", ("classeNudez",), 20, "num_at_least_2"),         # :31
+    ("transcrito", ("audio:transcription",), 15, "present"),   # :32
+    ("CPF", ("Regex:BR_CPF",), 10, "present"),                 # :33
+    ("telefone", ("Regex:PHONE",), 8, "present"),              # :34
+    ("URL", ("Regex:URL", "ufed:URL"), 5, "present"),          # :35
+    # GPS mantém AMBAS as variantes — TODO do próprio ICARO (:36-37
+    # "Chaves de GPS podem variar - validar na prova real!"); cobertura 0
+    # vira warning (MEDIA_GPS_ZERO_WARNING).
+    ("GPS", ("latitude", "ufed:latitude"), 15, "present"),     # :36-37
+    ("ext divergente", ("extMismatch",), 10, "flag_true"),     # :38
+    ("carved", ("carved",), 5, "flag_true"),                   # :39
+    ("deletado", ("deletado", "deleted"), 15, "flag_true"),    # :40-41
+    # "download financeiro": substring em ufed:URL (:42-45). O literal é
+    # "registrato" (não "registrado") — quirk pinado, não corrigir.
+    ("download financeiro", ("ufed:URL",), 15, "download_url"),  # :42-45
+)
+
+# Substrings do preditor "download financeiro". Origem: media_strategy.py:43-44.
+MEDIA_DOWNLOAD_URL_MARKERS = (
+    "boleto", "registrato", "bcb.gov.br", "comprovante", "fatura", "extrato",
+)
+
+# Base do score: 40 chat / 50 mídia. Origem: media_strategy.py:77; score =
+# base + soma dos pontos dos sinais encontrados (:78-79); justificação =
+# nomes dos sinais (:80-81, literais).
+MEDIA_BASE_CHAT = 40
+MEDIA_BASE_MEDIA = 50
+MEDIA_JUSTIFICATION_CHAT = "Chat (índice de referências)"        # :80
+MEDIA_JUSTIFICATION_PREFIX = "Mídia: "                           # :81
+MEDIA_JUSTIFICATION_NO_SIGNALS = "Mídia sem sinais"              # :81
+
+# Gate/chat: "whatsapp" na categoria E "chat" no nome, OU contentType marcada
+# (media_strategy.py:70-72); contentType lido de "contentType" (:70).
+MEDIA_CHAT_CATEGORY_MARKER = "whatsapp"
+MEDIA_CHAT_NAME_MARKER = "chat"
+MEDIA_CONTENT_TYPE_FIELD = "contentType"
+
+# Handler _finding_from_ranked_item (draft_report:963-975): score do próprio
+# item (default 50 :964 — no MCP o score é sempre o do preditor), relevância
+# ALTA >= 85 / MÉDIA >= 60 / BAIXA (:965).
+MEDIA_RELEVANCE_ALTA_MIN = 85
+MEDIA_RELEVANCE_MEDIA_MIN = 60
+MEDIA_SCORE_DEFAULT = 50  # :964 (getattr default; documentado no docstring)
+
+# Itens ranqueados entregues (teto MCP do eixo mais denso; §6.5).
+MEDIA_ITEMS_MAX = 50
+
+# Política de poda de serialização do ICARO: _MEDIA_DROP remove chaves de
+# blobs/binário e _MEDIA_MAX_VAL corta valores gigantes ANTES do prompt
+# (draft_report:75-77; uso real :798-806, substring case-insensitive da
+# chave). O envelope MCP NÃO serializa props cruas — a constante entra com o
+# papel dado pelo design §6.2: excluir essas chaves do histograma de campos
+# publicado (counters.field_hits), mesma intenção/custo zero. O teto de
+# valor vira pin de privacidade: nomes de campos entram no histograma,
+# VALORES jamais.
+MEDIA_DROP_KEYS = (
+    "face_encodings", "imagefeatures", "face_locations",
+    "thumb", "base64", "features",
+)
+MEDIA_MAX_VAL = 5000
+MEDIA_FIELD_HITS_TOP = 40  # política MCP: tamanho do histograma de nomes
+
+# Agregados do eixo (draft_report._media_owner_summary :1500-1537):
+# categoria crua ou "N/I" (:1509), apps por path/marcador e ServiceIdentifier
+# (:1519-1524), sinais de dono com "N/I" ignorado, dedup e teto 20
+# (:1525-1528, :1533).
+# Chaves de dono VISTAS EM MÍDIA. Origem: draft_report:81-84
+# (_OWNER_MEDIA_SIGNAL_KEYS). DIVERGÊNCIA DO DESIGN: o §6.3 lista
+# ("Author","dc_creator",...) — a cópia real tem EXATAMENTE estas 5 (registro
+# D-11 no relatório da fase).
+MEDIA_OWNER_SIGNAL_KEYS = (
+    "ufed:Account", "ufed:PhoneOwner", "ufed:ServiceIdentifier",
+    "Conversation:Account", "common:dc:creator",
+)
+MEDIA_OWNER_SIGNALS_MAX = 20                    # :1533 signals[:20]
+MEDIA_WHATSAPP_PATH_MARKER = "com.whatsapp"     # :1520
+MEDIA_WHATSAPP_APP_LABEL = "WhatsApp"           # :1520
+MEDIA_SERVICE_IDENTIFIER_FIELD = "ufed:ServiceIdentifier"  # :1522
+MEDIA_NOT_IDENTIFIED_VALUE = "N/I"              # :1509/:1527
+
+# Caso sem mídia aceita: triagem vazia explícita, não exceção (§0.1;
+# espelha base_strategy.py:71-73 — StrategyResult vazio).
+MEDIA_EMPTY_MESSAGE = (
+    "nenhum documento do eixo mídia (mídia, downloads ou chats de "
+    "referência) passou no gate deste source"
+)
+
+# Warning de cobertura do GPS (TODO do ICARO :36-37 materializado como
+# honestidade de superfície, M-7): mídia varrida sem UM único GPS.
+MEDIA_GPS_ZERO_WARNING = (
+    "cobertura GPS = 0: nenhuma das chaves {keys} produziu sinal na mídia "
+    "varrida (o índice pode usar outra variante — sinalizador de "
+    "descoberta, não afirma ausência de GPS no caso)"
+)
