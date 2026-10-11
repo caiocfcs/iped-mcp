@@ -107,33 +107,60 @@ def test_parser_valor_br_pinado(raw: Any, expected: float) -> None:
 # --- (b) escada, assinatura, quirks de gate -----------------------------------
 
 
-def test_escada_method_e_amount_com_dedup_por_assinatura(
-    webapi: Any, fake_router: Any
-) -> None:
-    """MONEY > Boleto > Conta (:183-191) e dedup por (money[0], conta[0])."""
-    _money(webapi, 10, "comprovante_1.pdf", ["R$ 1.234,56"])
-    _money(webapi, 11, "comprovante_2.pdf", ["R$ 1.234,56"])  # MESMA assinatura
+def test_escada_method_e_amount_do_ladder(webapi: Any, fake_router: Any) -> None:
+    """Escada fiel MONEY > Boleto > Conta (:183-191) com scores do handler."""
+    _money(webapi, 10, "comprovante.pdf", ["R$ 1.234,56"])
     _add_doc(webapi, 12, "boleto.pdf", {"Regex:BR_BOLETO": ["linha"]},
              category="documentos")
-    _add_doc(webapi, 13, "extrato.txt", {"Regex:BR_BANK_ACCOUNT": ["Ag 1234\nConta 5"]},
+    _add_doc(webapi, 13, "extrato.txt",
+             {"Regex:BR_BANK_ACCOUNT": ["Ag 1234\nConta 5"]},
              category="documentos")
 
     out = financial.triage_financial(SOURCE_ID)
 
     by_doc = {e["doc_id"]: e for e in out["evidences"]}
-    assert len(out["evidences"]) == 3  # doc 11 engolido pela assinatura
-    assert by_doc[10]["method"] == "Dinheiro/Valor Encontrado"
-    assert by_doc[10]["amount"] == "R$ 1.234,56"
-    assert by_doc[10]["score"] == 75
-    assert by_doc[12]["method"] == "Boleto"
-    assert by_doc[12]["amount"] == "Boleto Bancário"
-    # handler :886 pontua pelo AMOUNT: "Boleto Bancário" é amount não vazio e
-    # diferente de "Valor não identificação" → 75 (não 55 como o method sugere).
-    assert by_doc[12]["score"] == 75
-    assert by_doc[13]["method"] == "Comprovante/Conta"
-    assert by_doc[13]["amount"] == "Valor não identificado"
-    assert by_doc[13]["score"] == 55  # só esse cai para 55 (:886)
-    assert by_doc[13]["beneficiary"] == "Ag 1234 Conta 5"  # quebras colapsadas
+    assert (by_doc[10]["method"], by_doc[10]["amount"]) == (
+        "Dinheiro/Valor Encontrado", "R$ 1.234,56",
+    )
+    assert (by_doc[12]["method"], by_doc[12]["amount"]) == (
+        "Boleto", "Boleto Bancário",
+    )
+    assert (by_doc[13]["method"], by_doc[13]["amount"]) == (
+        "Comprovante/Conta", "Valor não identificado",
+    )
+
+
+def test_scores_do_handler_de_evidencia(webapi: Any, fake_router: Any) -> None:
+    """Handler :886 pontua pelo AMOUNT: 75 com valor (inclusive o literal
+    "Boleto Bancário", que NÃO é o sentinel), 55 só para o sentinel."""
+    _money(webapi, 10, "comprovante.pdf", ["R$ 1.234,56"])
+    _add_doc(webapi, 12, "boleto.pdf", {"Regex:BR_BOLETO": ["linha"]},
+             category="documentos")
+    _add_doc(webapi, 13, "extrato.txt", {"Regex:BR_BANK_ACCOUNT": ["Ag 1"]},
+             category="documentos")
+
+    out = financial.triage_financial(SOURCE_ID)
+
+    scores = {e["doc_id"]: e["score"] for e in out["evidences"]}
+    assert scores == {10: 75, 12: 75, 13: 55}
+
+
+def test_dedup_por_assinatura_e_beneficiary_colapsado(
+    webapi: Any, fake_router: Any
+) -> None:
+    """Dedup por (money[0], conta[0]) (:172) e beneficiary com quebras
+    colapsadas (:194-196)."""
+    _money(webapi, 10, "comprovante_1.pdf", ["R$ 1.234,56"])
+    _money(webapi, 11, "comprovante_2.pdf", ["R$ 1.234,56"])  # MESMA assinatura
+    _add_doc(webapi, 13, "extrato.txt",
+             {"Regex:BR_BANK_ACCOUNT": ["Ag 1234\nConta 5"]},
+             category="documentos")
+
+    out = financial.triage_financial(SOURCE_ID)
+
+    assert len(out["evidences"]) == 2  # doc 11 engolido pela assinatura
+    assert [e["doc_id"] for e in out["evidences"]] == [10, 13]
+    assert out["evidences"][1]["beneficiary"] == "Ag 1234 Conta 5"
 
 
 def test_evidencias_ordenadas_por_valor_desc(webapi: Any, fake_router: Any) -> None:
@@ -256,8 +283,16 @@ def test_cartao_score_86_e_fluxo_de_jumps(webapi: Any, fake_router: Any) -> None
     assert card["entity_name"] == "Credit Card: Nubank"
     assert card["justification"] == "13 transações | Total: R$ 136.50"
     assert card["source_wallet"] == "Google Pay"
-    # amostra das 5 últimas com omissão marcada (§4.6)
+
+
+def test_cartao_amostra_de_transacoes_marcada(webapi: Any, fake_router: Any) -> None:
+    """13 transações: amostra das 5 últimas no envelope, omissão marcada (§4.6)."""
+    _add_card_flow(webapi, 13)
+
+    card = financial.triage_financial(SOURCE_ID)["cards"][0]
+
     assert len(card["transactions"]) == knowledge.CARD_TRANSACTIONS_SAMPLE
+    assert card["transactions"][-1]["date"] == "2024-05-12"  # última descoberta
     assert card["transactions_truncated"] is True
     assert card["transactions_omitted"] == 8
 

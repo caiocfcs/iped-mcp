@@ -20,6 +20,9 @@ def register(mcp: FastMCP) -> None:
 
     Args:
         mcp: servidor FastMCP ativo.
+
+    Returns:
+        Nada.
     """
     register_financial(mcp)
     register_geolocation(mcp)

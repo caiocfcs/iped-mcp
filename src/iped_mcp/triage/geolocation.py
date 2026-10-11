@@ -162,7 +162,9 @@ def _dynamic_point(props: dict[str, Any]) -> tuple[float, float, tuple[str, ...]
         return None
     if not _in_bounds(lat, lon):
         return None
-    return lat, lon, tuple(k for k in (lat_field, lon_field) if k)
+    # lat_str/lon_str só existem quando o campo correspondente existe: o
+    # par de campos é sempre completo aqui.
+    return lat, lon, (lat_field, lon_field)
 
 
 def _geo_field_point(
