@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -18,27 +19,38 @@ from typing import Any
 import requests
 from fastmcp import FastMCP
 
+from iped_mcp import config, validation
+from iped_mcp.client import TEXT_STATUS_NO_TEXT
 from iped_mcp.config import WORKERS
+from iped_mcp.download import export_path, iso_utc, utc_now
 from iped_mcp.core.tool import doc_export
 from iped_mcp.fetch import (
     fetch_docs_parallel,
     get_document_props,
-    get_document_text,
+    get_document_text_cached,
     search_ids,
 )
+from iped_mcp.progress import op_envelope
 from iped_mcp.whatsapp.collect import MessageRecord, collect_messages
 from iped_mcp.whatsapp.queries import (
     MARKERS,
     PRIVATE_NAME_RE,
     bucket_key,
     build_account_query,
+    build_all_wa_query,
     build_audio_term_query,
+    build_contacts_query,
+    build_conversation_query,
     build_conversation_window_query,
+    build_date_range_query,
+    build_group_query,
     build_marker_query,
     build_media_by_hash,
     build_media_mime_query,
     build_message_term_query,
+    build_messages_query,
     build_pdf_query,
+    build_private_query,
     build_profile_query,
     classify_name,
     display_name,
@@ -46,10 +58,29 @@ from iped_mcp.whatsapp.queries import (
     normalize_range,
 )
 
-DEFAULT_EXPORTS_DIR = "/tmp/iped_mcp/exports"
-EXPORTS_DIR = os.environ.get("IPED_MCP_EXPORTS_DIR", DEFAULT_EXPORTS_DIR)
+# Estado do anexo quando a leitura do /text falhou (rede/404) — distinto de
+# no_text, que é a resposta 500 do servidor sem texto extraível (M-8).
+TEXT_STATUS_UNAVAILABLE = "unavailable"
+# Marcador literal de truncamento gravado no artefato de export (DESIGN 08 /
+# M-8, AC4): texto capped nunca entra no JSON como se fosse completo.
+TEXT_CAPPED_MARKER = "[TRUNCADO em {total_bytes} bytes — capped]"
+
+# Telemetria M-19: fração de referências de mídia das mensagens
+# (linkedItems "sha-256:...") que NÃO resolvem como doc de mídia
+# (ufed:SHA256) acima deste limiar faz o export acrescentar um aviso em
+# `warnings`. É limiar de telemetria (dado, nunca exceção); a superfície
+# de config do fork fica em config.py (M-11) e não controla isto.
+_UNLINK_WARNING_RATIO = 0.5
 
 _WA_HINT = "Use whatsapp_reference para conferir os campos e queries canônicas."
+
+# Placeholders de documentação da whatsapp_reference — nunca enviados ao IPED;
+# mostram apenas o formato da query canônica (o valor real entra no lugar).
+_REF_NUMBER_PLACEHOLDER = "<número>"
+_REF_HASH_PLACEHOLDER = "<HASH>"
+_REF_TERM_PLACEHOLDER = "<termo>"
+_REF_DATE_RANGE_BOUNDS = ("A", "B")
+_REF_DATE_RANGE_NOTE = "(superior date-only → T23:59:59Z)"
 
 _NO_WA_RESULT = {
     "has_whatsapp": False,
@@ -111,14 +142,40 @@ def _media_hash(props: dict[str, Any]) -> str | None:
     return None
 
 
+def _classify_attachment(entry: dict[str, Any], source_id: str, doc_id: int) -> None:
+    """Classifica o /text de um anexo como DADO (DESIGN 08 / M-8, padrão do
+    icaro iped_client.py:233-244): no_text/falha não abortam a coleta.
+
+    Args:
+        entry: entrada de mídia recém-criada (enriquecida no lugar).
+        source_id: source no IPED.
+        doc_id: doc do anexo.
+    """
+    result = get_document_text_cached(source_id, doc_id)
+    if result is None:
+        entry["attachment_status"] = TEXT_STATUS_UNAVAILABLE
+        return
+    entry["attachment_status"] = result.status
+    entry["attachment_text"] = result.text or None
+    entry["attachment_capped"] = result.capped
+    entry["attachment_bytes"] = result.total_bytes
+
+
 def _fetch_media(source_id: str, hashes: list[str]) -> dict[str, dict[str, Any]]:
     """Para cada sha-256: doc de mídia → transcrição (áudio) e/ou texto (PDF).
 
     Imagem → ambos None (F3.5: /text de imagem é vazio; sem OCR no escopo).
+    Anexos PDF entram classificados por estado (ok/no_text/unavailable +
+    capped), nunca por exceção (DESIGN 08 / M-8).
     """
 
     def _one(h: str) -> tuple[str, dict[str, Any] | None]:
-        entry: dict[str, Any] = {"transcription": None, "attachment_text": None}
+        entry: dict[str, Any] = {
+            "transcription": None,
+            "attachment_text": None,
+            "attachment_status": None,
+            "attachment_capped": False,
+        }
         try:
             ids = search_ids(build_media_by_hash(h), source_id, _WA_HINT)
             if not ids:
@@ -130,7 +187,7 @@ def _fetch_media(source_id: str, hashes: list[str]) -> dict[str, dict[str, Any]]
             category = _first(props.get("category"))
             content_type = _first(props.get("contentType"))
             if category == "PDF Documents" or content_type == "application/pdf":
-                entry["attachment_text"] = get_document_text(source_id, ids[0])
+                _classify_attachment(entry, source_id, ids[0])
         except (requests.RequestException, ValueError):
             return h, None
         return h, entry
@@ -144,7 +201,7 @@ def _fetch_media(source_id: str, hashes: list[str]) -> dict[str, dict[str, Any]]
 
 
 def _prepare_export_dir(output_dir: str | None) -> tuple[str, bool]:
-    target = str(output_dir) if output_dir else EXPORTS_DIR
+    target = str(output_dir) if output_dir else config.EXPORTS_DIR
     try:
         os.makedirs(target, exist_ok=True)
     except OSError as e:
@@ -154,43 +211,104 @@ def _prepare_export_dir(output_dir: str | None) -> tuple[str, bool]:
     return target, output_dir is not None and os.path.isabs(str(output_dir))
 
 
+def _attachment_for(
+    rec: MessageRecord, media: dict[str, dict[str, Any]]
+) -> tuple[str | None, str | None, bool]:
+    """Anexo de uma mensagem: (texto, status, capped) a partir da mídia coletada.
+
+    Última mídia classificada vence (comportamento legado preservado); texto
+    capped é gravado com o marcador literal de truncamento para o artefato
+    nunca parecer completo (DESIGN 08 / M-8, AC4).
+
+    Args:
+        rec: mensagem com `linked_hashes` a consultar.
+        media: mapa sha-256 → entrada produzida por `_fetch_media`.
+
+    Returns:
+        (texto com marcador quando capped, status ok/no_text/unavailable,
+        flag capped). (None, None, False) sem anexo classificado.
+    """
+    text: str | None = None
+    status: str | None = None
+    capped = False
+    for h in rec.linked_hashes:
+        entry = media.get(h)
+        if not entry or entry.get("attachment_status") is None:
+            continue
+        status = str(entry.get("attachment_status"))
+        capped = bool(entry.get("attachment_capped"))
+        if entry.get("attachment_text") is not None:
+            text = str(entry["attachment_text"])
+            if capped:
+                text = "{}\n\n{}".format(
+                    text,
+                    TEXT_CAPPED_MARKER.format(
+                        total_bytes=int(entry.get("attachment_bytes") or 0)
+                    ),
+                )
+    return text, status, capped
+
+
+def _export_dir_warning(output_dir: str | None, target: str, is_abs: bool) -> str | None:
+    """Aviso sobre o destino do JSON exportado; None quando sem ressalva.
+
+    Args:
+        output_dir: parâmetro recebido pela tool (None = diretório padrão).
+        target: diretório efetivo criado por `_prepare_export_dir`.
+        is_abs: se o `output_dir` informado era caminho absoluto.
+
+    Returns:
+        Texto de aviso para o resultado da tool, ou None.
+    """
+    if output_dir is None:
+        return (
+            f"JSON gravado no diretório padrão {target}. "
+            "Para gravar no seu projeto, chame novamente passando output_dir "
+            "com o caminho absoluto da pasta exports/."
+        )
+    if not is_abs:
+        return (
+            f"output_dir '{output_dir}' é relativo e resolve contra o cwd do "
+            "servidor (não do seu projeto). Use um caminho absoluto."
+        )
+    return None
+
+
 # --- tools --------------------------------------------------------------------
 
 
-def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
-    """Triagem do WhatsApp no source: totais, período, série mensal, conversas distintas e top interlocutores.
+def _collect_envelope(
+    started_at: float, records: list[MessageRecord], dropped: int
+) -> dict[str, Any]:
+    """Envelope M-9 da coleta WhatsApp (helper compartilhado pelas tools longas).
 
-    Responde "o que tem de WhatsApp aqui": total de docs WA, total de
-    mensagens, período (início/fim), mensagens por mês, nº de conversas
-    privadas/grupos/canais e as conversas mais volumosas. `top_interlocutors`
-    ranqueia conversas privadas por volume (enviadas/recebidas), excluindo o
-    dono e o artefato `0`. A primeira chamada é pesada (coleta completa das
-    mensagens do source, minutos); as seguintes usam cache de 5 min.
+    A coleta não é loteável por design: `sha_map` e todas as análises de
+    conversa exigem o corpus completo de mensagens, e o cache de 5 min já
+    amortiza a repetição (elapsed_s ≈ 0 no acerto informa o agente que nada
+    foi re-varrido). Varridos = docs de mensagem lidos (records + dropped).
 
     Args:
-        source_id: source no IPED (veja iped_list_sources).
-        top: nº de conversas/interlocutores a devolver (padrão 10).
+        started_at: `time.monotonic()` capturado no início da tool.
+        records: mensagens coletadas.
+        dropped: docs cujo fetch falhou (perda parcial sinalizada).
+
+    Returns:
+        Envelope de `op_envelope` sem chave `batch` (sem fatiamento), mais
+        `unclassified_messages` — telemetria M-19 da premissa de
+        classificacao: mensagens cujo `name` a regex nao classificou (kind
+        "other"); volume anormal = formato do `name` derivou (D-16).
     """
-    if top < 1:
-        raise ValueError("top deve ser >= 1.")
-    total_wa = len(search_ids("accountType:WhatsApp", source_id, _WA_HINT))
-    if total_wa == 0:
-        return {"source": source_id, **_NO_WA_RESULT}
-    total_messages = len(
-        search_ids(
-            'accountType:WhatsApp AND category:"Instant Messages"',
-            source_id,
-            _WA_HINT,
-        )
+    envelope = op_envelope(
+        started_at, scanned=len(records) + dropped, processed=len(records)
     )
-    records, _sha_map, dropped = collect_messages(source_id)
-    dates = sorted(r.date for r in records if r.date)
-    period = {"start": dates[0], "end": dates[-1]} if dates else None
-    monthly_counter = Counter(r.date[:7] for r in records if r.date)
-    monthly = [
-        {"month": month, "messages": count}
-        for month, count in sorted(monthly_counter.items())
-    ]
+    envelope["unclassified_messages"] = sum(1 for r in records if r.kind == "other")
+    return envelope
+
+
+def _overview_conversations(
+    records: list[MessageRecord], top: int
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Conta conversas por tipo e ordena o top-`top` por volume de mensagens."""
     conv: dict[str, dict[str, Any]] = {}
     for rec in records:
         if rec.kind in ("chat", "group", "channel") and rec.key:
@@ -201,20 +319,27 @@ def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
             entry["messages"] += 1
             if rec.kind == "chat" and not entry["name"]:
                 entry["name"] = display_name(rec.name)
-    conversations = {
+    conversations: dict[str, Any] = {
         "private": sum(1 for e in conv.values() if e["type"] == "chat"),
         "group": sum(1 for e in conv.values() if e["type"] == "group"),
         "channel": sum(1 for e in conv.values() if e["type"] == "channel"),
     }
-    conversations["total"] = conversations["private"] + conversations["group"] + conversations["channel"]
+    conversations["total"] = (
+        conversations["private"] + conversations["group"] + conversations["channel"]
+    )
     top_conversations = sorted(conv.values(), key=lambda e: -e["messages"])[:top]
-    owner = _owner_info(source_id)
-    owner_number = owner["owner_number"] if owner else None
+    return conversations, top_conversations
+
+
+def _overview_interlocutors(
+    records: list[MessageRecord], owner_number: str | None, top: int
+) -> list[dict[str, Any]]:
+    """Ranqueia privadas por volume (enviadas/recebidas), exceto dono e artefato `0`."""
     interloc: dict[str, dict[str, Any]] = {}
     for rec in records:
         if rec.kind != "chat" or not rec.key or rec.key == "0":
             continue
-        if owner_number and rec.key == owner_number:
+        if rec.key == owner_number:
             continue
         entry = interloc.setdefault(
             rec.key,
@@ -226,13 +351,52 @@ def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
             entry["received"] += 1
         if not entry["name"]:
             entry["name"] = display_name(rec.name)
-    top_interlocutors = [
+    return [
         {**e, "messages": e["sent"] + e["received"]}
         for e in sorted(
             interloc.values(), key=lambda e: -(e["sent"] + e["received"])
         )[:top]
     ]
-    return {
+
+
+def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
+    """Triagem do WhatsApp no source: totais, período, série mensal, conversas distintas e top interlocutores.
+
+    Responde "o que tem de WhatsApp aqui": total de docs WA, total de
+    mensagens, período (início/fim), mensagens por mês, nº de conversas
+    privadas/grupos/canais e as conversas mais volumosas. `top_interlocutors`
+    ranqueia conversas privadas por volume (enviadas/recebidas), excluindo o
+    dono e o artefato `0`. A primeira chamada é pesada (coleta completa das
+    mensagens do source, minutos); as seguintes usam cache de 5 min. O
+    envelope {scanned, processed, elapsed_s, phase} reporta a coleta da
+    chamada (elapsed_s ~0 = cache; a coleta não é loteável).
+
+    Args:
+        source_id: source no IPED (veja iped_list_sources).
+        top: nº de conversas/interlocutores a devolver (padrão 10, teto 1000).
+    """
+    validation.check_int_range(top, "top", 1, validation.TOP_VALUES_MAX)
+    started_at = time.monotonic()
+    if top < 1:
+        raise ValueError("top deve ser >= 1.")
+    total_wa = len(search_ids(build_all_wa_query(), source_id, _WA_HINT))
+    if total_wa == 0:
+        return {"source": source_id, **_NO_WA_RESULT, **_collect_envelope(started_at, [], 0)}
+    total_messages = len(
+        search_ids(build_messages_query(), source_id, _WA_HINT)
+    )
+    records, _sha_map, dropped = collect_messages(source_id)
+    dates = sorted(r.date for r in records if r.date)
+    period = {"start": dates[0], "end": dates[-1]} if dates else None
+    monthly_counter = Counter(r.date[:7] for r in records if r.date)
+    monthly = [
+        {"month": month, "messages": count}
+        for month, count in sorted(monthly_counter.items())
+    ]
+    conversations, top_conversations = _overview_conversations(records, top)
+    owner = _owner_info(source_id)
+    owner_number = owner["owner_number"] if owner else None
+    result: dict[str, Any] = {
         "source": source_id,
         "has_whatsapp": True,
         "total_wa": total_wa,
@@ -242,7 +406,7 @@ def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
         "monthly": monthly,
         "conversations": conversations,
         "top_conversations": top_conversations,
-        "top_interlocutors": top_interlocutors,
+        "top_interlocutors": _overview_interlocutors(records, owner_number, top),
         "owner": (
             {"number": owner_number, "excluded_from_interlocutors": True}
             if owner_number
@@ -253,6 +417,8 @@ def whatsapp_overview(source_id: str, top: int = 10) -> dict[str, Any]:
             "From/To (drift = eventos de sistema sem From/To)."
         ),
     }
+    result.update(_collect_envelope(started_at, records, dropped))
+    return result
 
 
 def whatsapp_account(source_id: str) -> dict[str, Any]:
@@ -371,6 +537,16 @@ def whatsapp_profile_photo(
     }
 
 
+def _conversation_series(
+    conv: list[MessageRecord], granularity: str
+) -> list[dict[str, Any]]:
+    """Série de intensidade da conversa: completa (month) ou top-10 (week/day)."""
+    buckets = Counter(bucket_key(r.date, granularity) for r in conv if r.date)
+    if granularity == "month":
+        return [{"bucket": b, "messages": c} for b, c in sorted(buckets.items())]
+    return [{"bucket": b, "messages": c} for b, c in buckets.most_common(10)]
+
+
 def whatsapp_conversation(
     source_id: str, number: str, granularity: str = "month"
 ) -> dict[str, Any]:
@@ -389,6 +565,7 @@ def whatsapp_conversation(
     """
     if granularity not in ("month", "week", "day"):
         raise ValueError("granularity deve ser month, week ou day.")
+    started_at = time.monotonic()
     num = _require_number(number)
     records, _sha_map, dropped = collect_messages(source_id)
     conv = [r for r in records if r.kind == "chat" and r.key == num]
@@ -402,19 +579,11 @@ def whatsapp_conversation(
                 "parecido (whatsapp_overview lista os interlocutores) — pode "
                 "ser conversa de grupo (Fase 4)."
             ),
+            **_collect_envelope(started_at, records, dropped),
         }
     sent = sum(1 for r in conv if r.to_number == num)
     received = sum(1 for r in conv if r.from_number == num)
     dates = sorted(r.date for r in conv if r.date)
-    buckets = Counter(bucket_key(r.date, granularity) for r in conv if r.date)
-    if granularity == "month":
-        series = [
-            {"bucket": b, "messages": c} for b, c in sorted(buckets.items())
-        ]
-    else:
-        series = [
-            {"bucket": b, "messages": c} for b, c in buckets.most_common(10)
-        ]
     return {
         "source": source_id,
         "number": num,
@@ -426,7 +595,11 @@ def whatsapp_conversation(
         "received": received,
         "no_direction": len(conv) - sent - received,
         "period": {"start": dates[0], "end": dates[-1]} if dates else None,
-        "intensity": {"granularity": granularity, "buckets": series},
+        "intensity": {
+            "granularity": granularity,
+            "buckets": _conversation_series(conv, granularity),
+        },
+        **_collect_envelope(started_at, records, dropped),
     }
 
 
@@ -483,6 +656,209 @@ def whatsapp_conversation_window(
     }
 
 
+def _export_window(start: str | None, end: str | None) -> tuple[str, str] | None:
+    """Janela de datas validada e normalizada para o export.
+
+    Args:
+        start: início informado (ISO 8601 ou DD/MM/YYYY[ HH:MM[:SS]]).
+        end: fim informado (mesmos formatos).
+
+    Returns:
+        Par (inicio, fim) normalizado, ou None quando nenhum limite veio.
+
+    Raises:
+        ValueError: apenas um dos dois limites informado, ou formato inválido
+            (propagado de `normalize_range`).
+    """
+    if not (start or end):
+        return None
+    if not (start and end):
+        raise ValueError("'start' e 'end' devem ser informados juntos.")
+    return normalize_range(start, end)
+
+
+def _unlink_counters(
+    selected: list[MessageRecord], media: dict[str, dict[str, Any]]
+) -> dict[str, int]:
+    """Contadores de desvinculação mídia↔mensagem do export (telemetria M-19).
+
+    A premissa do vínculo é `linkedItems "sha-256:..." ⇄ ufed:SHA256`
+    (collect.py); quando uma referência não resolve como doc de mídia, a
+    mensagem sai do artefato sem anexo em silêncio (D-15). Os contadores
+    tornam essa perda visível SEM mudar o comportamento do export — o
+    "continue" silencioso do laço de mídia passa a ter contagem equivalente
+    aqui, calculada de uma vez sobre selecionadas × mídia resolvida.
+
+    Args:
+        selected: mensagens selecionadas para o export (ordem cronológica).
+        media: anexos resolvidos por sha-256 (saída de `_fetch_media`;
+            hash ausente = mídia não resolvida).
+
+    Returns:
+        {"media_links_total": refs sha-256 somadas nas mensagens,
+         "media_links_unresolved": refs sem doc de mídia resolvido,
+         "messages_with_unresolved_media": mensagens com ≥1 ref perdida}.
+    """
+    total = 0
+    unresolved = 0
+    messages_unresolved = 0
+    for rec in selected:
+        rec_has_unresolved = False
+        for h in rec.linked_hashes:
+            total += 1
+            if h not in media:
+                unresolved += 1
+                rec_has_unresolved = True
+        if rec_has_unresolved:
+            messages_unresolved += 1
+    return {
+        "media_links_total": total,
+        "media_links_unresolved": unresolved,
+        "messages_with_unresolved_media": messages_unresolved,
+    }
+
+
+def _unlink_warning(counters: dict[str, int]) -> str | None:
+    """Aviso quando a taxa de desvinculação passa do limiar (M-19; nunca lança).
+
+    O contrato é dado no retorno da tool: acima do limiar o export ganha a
+    chave `warnings` com o texto; abaixo (ou sem links), None e nenhum
+    comportamento muda — nunca uma exceção.
+
+    Args:
+        counters: saída de `_unlink_counters`.
+
+    Returns:
+        Texto de aviso quando `media_links_unresolved / media_links_total`
+        EXCEDE `_UNLINK_WARNING_RATIO`; None no limiar, abaixo, ou quando
+        não há links a avaliar.
+    """
+    total = counters["media_links_total"]
+    unresolved = counters["media_links_unresolved"]
+    if total == 0 or unresolved / total <= _UNLINK_WARNING_RATIO:
+        return None
+    pct = round(100.0 * unresolved / total)
+    return (
+        f"{unresolved}/{total} referências de mídia das mensagens ({pct}%) não "
+        'resolvem como docs de mídia (linkedItems "sha-256:..." ⇄ '
+        f"ufed:SHA256), acima do limiar de {_UNLINK_WARNING_RATIO:.0%}: a "
+        "premissa do vínculo ou a classificação de conversa (regex do `name` "
+        "+ `Communication:Date`) pode ter derivado de formato. Antes de "
+        "confiar no artefato, confira um hash via iped_search "
+        "(ufed:SHA256) e a classificação em whatsapp_overview "
+        "(unclassified_messages)."
+    )
+
+
+def _selected_hashes(selected: list[MessageRecord]) -> list[str]:
+    """Hashes de mídia das mensagens, únicos e em ordem de aparição.
+
+    Args:
+        selected: mensagens selecionadas para o export.
+
+    Returns:
+        Lista determinística de sha-256 a coletar via `_fetch_media`.
+    """
+    hashes: list[str] = []
+    for rec in selected:
+        for h in rec.linked_hashes:
+            if h not in hashes:
+                hashes.append(h)
+    return hashes
+
+
+def _build_export_messages(
+    selected: list[MessageRecord],
+    fetched: list[tuple[int, dict | None]],
+    media: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Mensagens do artefato JSON: corpo, transcrição e anexo classificado.
+
+    Args:
+        selected: mensagens selecionadas (ordem cronológica).
+        fetched: propriedades por doc (par de `fetch_docs_parallel`).
+        media: anexos classificados por sha-256 (de `_fetch_media`).
+
+    Returns:
+        Mensagens no formato do export com `attachment_status` e
+        `attachment_capped` (DESIGN 08 / M-8).
+    """
+    messages = []
+    for rec, (_doc_id, props) in zip(selected, fetched):
+        body = _first(props.get("Message-Body")) if props else None
+        date = _first(props.get("Communication:Date")) if props else rec.date
+        transcription: str | None = None
+        for h in rec.linked_hashes:
+            entry = media.get(h)
+            if entry and entry["transcription"] is not None:
+                transcription = entry["transcription"]
+        attachment_text, attachment_status, attachment_capped = _attachment_for(
+            rec, media
+        )
+        messages.append(
+            {
+                "id": rec.doc_id,
+                "date": str(date) if date is not None else None,
+                "text": str(body) if body is not None else None,
+                "audio_transcription": transcription,
+                "attachment_text": attachment_text,
+                "attachment_status": attachment_status,
+                "attachment_capped": attachment_capped,
+            }
+        )
+    return messages
+
+
+def _write_export_json(
+    target: str,
+    source_id: str,
+    num: str,
+    window: tuple[str, str] | None,
+    now: datetime,
+    messages: list[dict[str, Any]],
+    overwrite: bool = False,
+) -> str:
+    """Grava o artefato JSON do export e devolve o caminho absoluto.
+
+    Args:
+        target: diretório efetivo (de `_prepare_export_dir`).
+        source_id: source no IPED (compõe o nome do arquivo).
+        num: número normalizado do interlocutor (compõe o nome).
+        window: janela de datas registrada no artefato (None = sem recorte).
+        now: timestamp UTC usado no nome do arquivo e em `generated_at`.
+        messages: mensagens montadas por `_build_export_messages`.
+        overwrite: True reescreve o MESMO arquivo (default no-clobber M-10).
+
+    Returns:
+        Caminho absoluto do JSON gravado.
+    """
+    path = export_path(
+        target, source_id, f"whatsapp_{num}", ext=".json", now=now, overwrite=overwrite
+    )
+    payload = {
+        "source": source_id,
+        "number": num,
+        "window": {"start": window[0], "end": window[1]} if window else None,
+        "generated_at": iso_utc(now),
+        "exported": len(messages),
+        "messages": messages,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def _export_filtered(
+    conv: list[MessageRecord], window: tuple[str, str] | None
+) -> list[MessageRecord]:
+    """Aplica a janela ISO opcional (comparação lexicográfica) e ordena por data."""
+    if window:
+        w_start, w_end = window
+        conv = [r for r in conv if r.date and w_start <= r.date <= w_end]
+    conv.sort(key=lambda r: r.date or "")
+    return conv
+
+
 def whatsapp_export_conversation(
     source_id: str,
     number: str,
@@ -490,15 +866,21 @@ def whatsapp_export_conversation(
     end: str | None = None,
     limit: int = 500,
     output_dir: str | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Exporta as mensagens de uma conversa privada do WhatsApp para um arquivo JSON local, com texto, transcrição de áudio e texto de PDF anexado.
 
     Cada mensagem sai com id, date, text (Message-Body), audio_transcription
     (do doc de mídia via linkedItems) e attachment_text (texto extraído do
     PDF anexado via /text). Imagem → null (sem OCR no escopo); PDF Android
-    não tem linkedItems → null. O JSON é gravado em output_dir (ou
-    $IPED_MCP_EXPORTS_DIR, ou /tmp/iped_mcp/exports) e o caminho absoluto é
-    devolvido (conteúdo nunca entra em contexto).
+    não tem linkedItems → null. Cada mensagem traz `attachment_status`
+    (ok/no_text/unavailable) e `attachment_capped`; texto truncado no teto
+    de leitura é gravado com o marcador "[TRUNCADO em N bytes — capped]"
+    (DESIGN 08 / M-8). O JSON é gravado em output_dir (ou
+    $IPED_MCP_EXPORTS_DIR) e o caminho absoluto é devolvido (conteúdo nunca
+    entra em contexto). Nome do artefato (M-10):
+    `<UTC-ts>_<source>_whatsapp_<num>.json` — reexecução cria arquivo novo
+    (colisão ganha `-N`), nunca destrói o export anterior.
 
     Args:
         source_id: source no IPED (veja iped_list_sources).
@@ -507,16 +889,22 @@ def whatsapp_export_conversation(
         end: fim da janela opcional (mesmos formatos; start e end juntos).
         limit: máximo de mensagens (padrão 500, teto 500).
         output_dir: pasta de destino do JSON (recomendado: caminho absoluto;
-            sem o parâmetro, grava em /tmp/iped_mcp/exports).
+            sem o parâmetro, usa `$IPED_MCP_EXPORTS_DIR`).
+        overwrite: True permite reescrever o MESMO JSON na reexecução
+            (default False: nome único com timestamp UTC, sem sobrescrita).
+
+    Retorna (telemetria M-19): além do caminho do artefato, o resultado traz
+    `media_links_total`, `media_links_unresolved`,
+    `messages_with_unresolved_media` e `unclassified_messages` (mensagens
+    cuja regex do `name` não classificou a conversa). Se a taxa de
+    referências não resolvidas EXCEDER `_UNLINK_WARNING_RATIO`, um aviso
+    entra na lista `warnings` — nunca uma exceção: o export continua sendo
+    escrito normalmente (risco nulo; só visibilidade da premissa).
     """
-    if not 1 <= limit <= 500:
-        raise ValueError("limit deve estar entre 1 e 500.")
+    validation.check_int_range(limit, "limit", 1, validation.DOCS_LIMIT_MAX)
+    started_at = time.monotonic()
     num = _require_number(number)
-    window: tuple[str, str] | None = None
-    if start or end:
-        if not (start and end):
-            raise ValueError("'start' e 'end' devem ser informados juntos.")
-        window = normalize_range(start, end)
+    window = _export_window(start, end)
     records, _sha_map, dropped = collect_messages(source_id)
     conv = [r for r in records if r.kind == "chat" and r.key == num]
     if not conv:
@@ -525,57 +913,18 @@ def whatsapp_export_conversation(
             "number": num,
             "found": False,
             "hint": "nenhuma conversa privada com este número (ver whatsapp_overview).",
+            **_collect_envelope(started_at, records, dropped),
         }
-    if window:
-        w_start, w_end = window
-        conv = [r for r in conv if r.date and w_start <= r.date <= w_end]
-    conv.sort(key=lambda r: r.date or "")
+    conv = _export_filtered(conv, window)
     selected = conv[:limit]
     fetched = fetch_docs_parallel(source_id, [r.doc_id for r in selected])
-    hashes: list[str] = []
-    for rec in selected:
-        for h in rec.linked_hashes:
-            if h not in hashes:
-                hashes.append(h)
-    media = _fetch_media(source_id, hashes)
-    messages = []
-    for rec, (_doc_id, props) in zip(selected, fetched):
-        body = _first(props.get("Message-Body")) if props else None
-        date = _first(props.get("Communication:Date")) if props else rec.date
-        transcription: str | None = None
-        attachment_text: str | None = None
-        for h in rec.linked_hashes:
-            entry = media.get(h)
-            if not entry:
-                continue
-            if entry["transcription"] is not None:
-                transcription = entry["transcription"]
-            if entry["attachment_text"] is not None:
-                attachment_text = entry["attachment_text"]
-        messages.append(
-            {
-                "id": rec.doc_id,
-                "date": str(date) if date is not None else None,
-                "text": str(body) if body is not None else None,
-                "audio_transcription": transcription,
-                "attachment_text": attachment_text,
-            }
-        )
+    media = _fetch_media(source_id, _selected_hashes(selected))
+    counters = _unlink_counters(selected, media)
+    messages = _build_export_messages(selected, fetched, media)
     target, is_abs = _prepare_export_dir(output_dir)
-    now = datetime.now()
-    path = os.path.abspath(
-        os.path.join(target, f"whatsapp_{source_id}_{num}_{now:%Y%m%d-%H%M%S}.json")
+    path = _write_export_json(
+        target, source_id, num, window, utc_now(), messages, overwrite
     )
-    payload = {
-        "source": source_id,
-        "number": num,
-        "window": {"start": window[0], "end": window[1]} if window else None,
-        "generated_at": now.isoformat(timespec="seconds"),
-        "exported": len(messages),
-        "messages": messages,
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
     result: dict[str, Any] = {
         "source": source_id,
         "number": num,
@@ -584,18 +933,99 @@ def whatsapp_export_conversation(
         "total_in_conversation": len(conv),
         "dropped_docs": dropped,
     }
-    if output_dir is None:
-        result["warning"] = (
-            f"JSON gravado no diretório padrão {target}. "
-            "Para gravar no seu projeto, chame novamente passando output_dir "
-            "com o caminho absoluto da pasta exports/."
-        )
-    elif not is_abs:
-        result["warning"] = (
-            f"output_dir '{output_dir}' é relativo e resolve contra o cwd do "
-            "servidor (não do seu projeto). Use um caminho absoluto."
-        )
+    warning = _export_dir_warning(output_dir, target, is_abs)
+    if warning:
+        result["warning"] = warning
+    unlink_notice = _unlink_warning(counters)
+    if unlink_notice:
+        result["warnings"] = [unlink_notice]
+    result.update(counters)
+    result.update(_collect_envelope(started_at, records, dropped))
     return result
+
+
+def _message_hits(source_id: str, term: str) -> Counter:
+    """Camada 1: hits por interlocutor no corpo das mensagens (token Lucene).
+
+    Args:
+        source_id: source no IPED.
+        term: termo buscado (ja trimado).
+
+    Returns:
+        Contador numero → nº de docs de mensagem com hit.
+    """
+    hits: Counter = Counter()
+    msg_ids = search_ids(build_message_term_query(term), source_id, _WA_HINT)
+    for _doc_id, props in fetch_docs_parallel(source_id, msg_ids):
+        if not props:
+            continue
+        name = str(_first(props.get("name")) or "")
+        m = PRIVATE_NAME_RE.match(name)
+        if m:
+            hits[m.group(1)] += 1
+    return hits
+
+
+def _audio_hits(source_id: str, term: str, sha_map: dict[str, set[str]]) -> Counter:
+    """Camada 2: hits por interlocutor na transcrição de áudios vinculados.
+
+    Args:
+        source_id: source no IPED.
+        term: termo buscado (query Lucene de transcrição).
+        sha_map: sha-256 da mídia → chaves de conversa (de collect_messages).
+
+    Returns:
+        Contador numero → nº de áudios transcritos com hit.
+    """
+    hits: Counter = Counter()
+    aud_ids = search_ids(build_audio_term_query(term), source_id, _WA_HINT)
+    for _doc_id, props in fetch_docs_parallel(source_id, aud_ids):
+        if not props:
+            continue
+        for key in sha_map.get(_media_hash(props) or "") or ():
+            hits[key] += 1
+    return hits
+
+
+def _attachment_hits(source_id: str, term: str, sha_map: dict[str, set[str]]) -> Counter:
+    """Camada 3: substring case-insensitive no /text de todos os PDFs do source.
+
+    PDF sem texto extraível (no_text) ou falha de leitura é CLASSIFICADO e o
+    fluxo segue — nunca aborta a varredura (DESIGN 08 / M-8). Leitura via
+    cache de texto (o mesmo doc pode aparecer em várias varreduras).
+
+    Args:
+        source_id: source no IPED.
+        term: termo buscado (comparação em minúsculas).
+        sha_map: sha-256 da mídia → chaves de conversa (de collect_messages).
+
+    Returns:
+        Contador numero → nº de PDFs anexados com hit.
+    """
+    hits: Counter = Counter()
+    pdf_ids = search_ids(build_pdf_query(), source_id, _WA_HINT)
+    term_lower = term.lower()
+    pdf_targets: list[tuple[int, tuple[str, ...]]] = []
+    for doc_id, props in fetch_docs_parallel(source_id, pdf_ids):
+        if not props:
+            continue
+        keys = tuple(sha_map.get(_media_hash(props) or "") or ())
+        if keys:
+            pdf_targets.append((doc_id, keys))
+
+    def _pdf_hit(item: tuple[int, tuple[str, ...]]) -> tuple[tuple[str, ...], bool]:
+        doc_id, keys = item
+        result = get_document_text_cached(source_id, doc_id)
+        if result is None or result.status == TEXT_STATUS_NO_TEXT:
+            return keys, False
+        return keys, term_lower in result.text.lower()
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for keys, hit in pool.map(_pdf_hit, pdf_targets):
+            if hit:
+                for key in keys:
+                    hits[key] += 1
+    return hits
 
 
 def whatsapp_text_search(source_id: str, term: str, top: int = 10) -> dict[str, Any]:
@@ -617,45 +1047,12 @@ def whatsapp_text_search(source_id: str, term: str, top: int = 10) -> dict[str, 
         raise ValueError("'term' não pode ser vazio.")
     if top < 1:
         raise ValueError("top deve ser >= 1.")
+    started_at = time.monotonic()
     term = term.strip()
     records, sha_map, dropped = collect_messages(source_id)
-    msg_hits: Counter = Counter()
-    msg_ids = search_ids(build_message_term_query(term), source_id, _WA_HINT)
-    for _doc_id, props in fetch_docs_parallel(source_id, msg_ids):
-        if not props:
-            continue
-        name = str(_first(props.get("name")) or "")
-        m = PRIVATE_NAME_RE.match(name)
-        if m:
-            msg_hits[m.group(1)] += 1
-    aud_hits: Counter = Counter()
-    aud_ids = search_ids(build_audio_term_query(term), source_id, _WA_HINT)
-    for _doc_id, props in fetch_docs_parallel(source_id, aud_ids):
-        if not props:
-            continue
-        for key in sha_map.get(_media_hash(props) or "") or ():
-            aud_hits[key] += 1
-    att_hits: Counter = Counter()
-    pdf_ids = search_ids(build_pdf_query(), source_id, _WA_HINT)
-    term_lower = term.lower()
-    pdf_targets: list[tuple[int, tuple[str, ...]]] = []
-    for doc_id, props in fetch_docs_parallel(source_id, pdf_ids):
-        if not props:
-            continue
-        keys = tuple(sha_map.get(_media_hash(props) or "") or ())
-        if keys:
-            pdf_targets.append((doc_id, keys))
-
-    def _pdf_hit(item: tuple[int, tuple[str, ...]]) -> tuple[tuple[str, ...], bool]:
-        doc_id, keys = item
-        text = get_document_text(source_id, doc_id)
-        return keys, bool(text) and term_lower in text.lower()
-
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for keys, hit in pool.map(_pdf_hit, pdf_targets):
-            if hit:
-                for key in keys:
-                    att_hits[key] += 1
+    msg_hits = _message_hits(source_id, term)
+    aud_hits = _audio_hits(source_id, term, sha_map)
+    att_hits = _attachment_hits(source_id, term, sha_map)
     all_keys = set(msg_hits) | set(aud_hits) | set(att_hits)
     ranked = [
         {
@@ -680,6 +1077,104 @@ def whatsapp_text_search(source_id: str, term: str, top: int = 10) -> dict[str, 
             "total": len(all_keys),
         },
         "top": ranked[:top],
+        **_collect_envelope(started_at, records, dropped),
+    }
+
+
+def _reference_canonical_filters() -> dict[str, str]:
+    """Filtros canônicos da referência, gerados pelos builders (fonte única).
+
+    Returns:
+        Mapa nome do filtro → query Lucene exata produzida pelo builder.
+    """
+    date_from, date_to = _REF_DATE_RANGE_BOUNDS
+    return {
+        "all_whatsapp": build_all_wa_query(),
+        "messages": build_messages_query(),
+        "group_messages": build_group_query(),
+        "private_messages": build_private_query(),
+        "private_conversation": build_conversation_query(_REF_NUMBER_PLACEHOLDER),
+        "date_range": (
+            f"{build_date_range_query(date_from, date_to)} "
+            f"{_REF_DATE_RANGE_NOTE}"
+        ),
+        "account": build_account_query(),
+        "contacts": build_contacts_query(),
+        "media_by_hash": build_media_by_hash(_REF_HASH_PLACEHOLDER),
+        "audio_transcription": build_audio_term_query(_REF_TERM_PLACEHOLDER),
+        "pdf_with_text": build_pdf_query(),
+    }
+
+
+def _reference_name_patterns() -> dict[str, str]:
+    """Padrões documentais de `name`; a regex vem do canôn PRIVATE_NAME_RE."""
+    return {
+        "private": "WhatsApp Chat - <contato> - <número>_message_<n> (iPhone: <número>_0_message_<n>; Android sem nome: WhatsApp Chat - <número>_message_<n>)",
+        "group": "WhatsApp Group - <grupo> - <jid>_message_<n> (Android: <jid>_0_message_<n>)",
+        "channel": "WhatsApp Channel - <nome> - <jid>_message_<n>",
+        "status": "WhatsApp Status - <nome> - <número>_message_<n> (só iPhone)",
+        "account": "WhatsApp Account: <nome>",
+        "contact": "WhatsApp Contact: <nome>",
+            "private_key_regex": PRIVATE_NAME_RE.pattern,
+    }
+
+
+def _reference_type_markers() -> dict[str, str]:
+    """Marcadores de tipo via builders de marcador/mime (validados em F1 D1.4).
+
+    Returns:
+        Mapa tipo → query exata do marcador, mais a nota de uso de `mediaMime`.
+    """
+    return {
+        "audio": build_marker_query("audio"),
+        "image": build_marker_query("image"),
+        "video": build_marker_query("video"),
+        "pdf": build_media_mime_query("application/pdf"),
+        "note": (
+            "mediaMime só com valor exato (sem wildcard) e é multi-valorado "
+            "(jpeg=webp=png — não somar)."
+        ),
+    }
+
+
+def _reference_pitfalls() -> dict[str, str]:
+    """Armadilhas documentadas (F1/F2/F3) — conteúdo estático de referência."""
+    return {
+        "F1.1": "campo com ':' no nome sem escape (Communication:From, audio:transcription, ufed:SHA256) → HTTP 500; usar Communication\\:From etc.",
+        "F1.2": "name é tokenizado: name:WhatsApp*message* → 0; usar tokens exatos (name:Chat AND name:<número>).",
+        "F1.3": "isGroupMessage só existe quando true: isGroupMessage:false → 0.",
+        "F1.4": "Communication:To:Group não é confiável p/ grupo (ex.: 1.489 vs 6.055 do isGroupMessage:true).",
+        "F1.5": "mediaMime sem wildcard: mediaMime:image/* → 0; usar valor exato (mediaMime:image/jpeg).",
+        "F1.6": "transcrição de áudio fica no doc de mídia (audio:transcription), não na mensagem.",
+        "F1.7": "accountType:WhatsApp inclui não-mensagens (conta, contatos, status, chamadas).",
+        "F1.8": "volume alto (10⁴–10⁵ docs): contagem + amostra, nunca a lista cheia.",
+        "F1.9": "negação Lucene: X -Y AND Z descarta X; usar X AND -Y AND Z, (X -Y) AND Z ou NOT Y.",
+        "F1.10": "@ em valor sem aspas → HTTP 500; usar prefixo numérico (Name:<número>*).",
+        "F1.11": "contentType sem aspas → misparse (1.499.455 docs); valor entre aspas.",
+        "F1.12": "name:WhatsApp é superset (+imagens de perfil, pastas, logs).",
+        "F1.13": "mediaMime multi-valorado (jpeg=webp=png) — não somar.",
+        "F1.14": "contentType não é filtro confiável de mensagem (message/x-whatsapp-message < IM).",
+        "F1.15": "nome de grupo Android com segmento extra: <jid>_0_message_<n>.",
+        "F1.16": "PDF Android não tem linkedItems (sem link mensagem→mídia).",
+        "F1.17": "link mensagem→mídia é unidirecional (linkedItems sha-256 → ufed\\:SHA256).",
+        "F1.18": "min/max por amostra não é o real; usar coleta completa ou busca binária.",
+        "F2.1": "WhatsApp Channels: isGroupMessage:true INCLUI canais; separar grupo×canal só pelo prefixo do name.",
+        "F2.2": "chat privado iPhone com segmento extra _N: <número>_0_message_<n>.",
+        "F2.3": "chat privado Android sem nome: WhatsApp Chat - <número>_message_<n>.",
+        "F2.4": "From/To em 4 formatos (Nome (número) · Nome (JID) · JID puro · ausente).",
+        "F2.5": "msg de grupo sem isGroupMessage (eventos de sistema): contagem por flag subconta; usar name-based.",
+        "F2.6": "range de data date-only no fim trunca o último dia; usar T23:59:59Z.",
+        "F2.7": "@ em valor da query → HTTP 500; usar prefixo numérico Name:<número>*.",
+        "F2.8": "isGroupMessage:true também em chamadas de grupo e 1 contato (só Android); p/ msgs: IM AND isGroupMessage:true.",
+        "F2.9": "artefato WhatsApp Chat - 0_message_N (ex.: 4 docs From:'0'); excluir da contagem real.",
+        "F2.10": "self-chat do dono (Mensagens salvas): entra nas conversas privadas, não vira interlocutor.",
+        "F2.11": "name:<número> casa Status/Chamadas (+1/+poucos); usar name:Chat AND name:<número>.",
+        "F3.1": "doc_text não é buscável via /search; texto de anexo só iterando /text nos PDFs.",
+        "F3.2": "filtro privado bruto inclui eventos de grupo/canal sem a flag; refinar por name prefix WhatsApp Chat - .",
+        "F3.3": "token Lucene ≠ substring (Message-Body:pix ≠ pixeado); a query Lucene é a canônica.",
+        "F3.4": "PDF vazio (size=0) tem /text vazio; filtrar size:[1 TO *].",
+        "F3.5": "imagem tem /text vazio (só quebras de linha); attachment_text só útil p/ PDF/documento.",
+        "F3.6": "name:<número> casa Status; usar name:Chat AND name:<número> p/ conversa privada exata.",
     }
 
 
@@ -687,82 +1182,21 @@ def whatsapp_reference() -> dict[str, Any]:
     """Referência validada de campos, padrões de name, marcadores de tipo e queries canônicas do WhatsApp no IPED, com as armadilhas conhecidas.
 
     Use em dúvida sobre um campo ou query antes de montar buscas livres
-    (iped_search). Sem chamada ao IPED (conteúdo estático, derivado dos
-    testes validados das Fases 1–3).
+    (iped_search). Sem chamada ao IPED: as queries são geradas pelos builders
+    canônicos de `iped_mcp.whatsapp.queries` (fonte única); o restante é
+    conteúdo estático derivado dos testes validados das Fases 1–3.
     """
     return {
-        "canonical_filters": {
-            "all_whatsapp": "accountType:WhatsApp",
-            "messages": 'accountType:WhatsApp AND category:"Instant Messages"',
-            "group_messages": "isGroupMessage:true",
-            "private_messages": 'accountType:WhatsApp AND category:"Instant Messages" AND -isGroupMessage:true',
-            "private_conversation": 'accountType:WhatsApp AND category:"Instant Messages" AND -isGroupMessage:true AND name:Chat AND name:<número>',
-            "date_range": "Communication\\:Date:[A TO B] (superior date-only → T23:59:59Z)",
-            "account": 'contentType:"application/x-whatsapp-account"',
-            "contacts": "accountType:WhatsApp AND name:Contact",
-            "media_by_hash": "ufed\\:SHA256:<HASH>",
-            "audio_transcription": "audio\\:transcription:<termo>",
-            "pdf_with_text": 'category:"PDF Documents" AND size:[1 TO *]',
-        },
-        "name_patterns": {
-            "private": "WhatsApp Chat - <contato> - <número>_message_<n> (iPhone: <número>_0_message_<n>; Android sem nome: WhatsApp Chat - <número>_message_<n>)",
-            "group": "WhatsApp Group - <grupo> - <jid>_message_<n> (Android: <jid>_0_message_<n>)",
-            "channel": "WhatsApp Channel - <nome> - <jid>_message_<n>",
-            "status": "WhatsApp Status - <nome> - <número>_message_<n> (só iPhone)",
-            "account": "WhatsApp Account: <nome>",
-            "contact": "WhatsApp Contact: <nome>",
-            "private_key_regex": r"^WhatsApp Chat - (?:.+ - )?(\d+)(?:_\d+)?_message_\d+$",
-        },
-        "type_markers": {
-            "audio": 'Message-Body:"! AUDIO_MESSAGE"',
-            "image": 'Message-Body:"! IMAGE_MESSAGE"',
-            "video": 'Message-Body:"! VIDEO_MESSAGE"',
-            "pdf": "mediaMime:application/pdf",
-            "note": "mediaMime só com valor exato (sem wildcard) e é multi-valorado (jpeg=webp=png — não somar).",
-        },
+        "canonical_filters": _reference_canonical_filters(),
+        "name_patterns": _reference_name_patterns(),
+        "type_markers": _reference_type_markers(),
         "from_to_formats": [
             "Nome (5511999999999)",
             "Nome (5511999999999@s.whatsapp.net)",
             "5511999999999@s.whatsapp.net (JID puro)",
             "ausente (eventos de sistema)",
         ],
-        "pitfalls": {
-            "F1.1": "campo com ':' no nome sem escape (Communication:From, audio:transcription, ufed:SHA256) → HTTP 500; usar Communication\\:From etc.",
-            "F1.2": "name é tokenizado: name:WhatsApp*message* → 0; usar tokens exatos (name:Chat AND name:<número>).",
-            "F1.3": "isGroupMessage só existe quando true: isGroupMessage:false → 0.",
-            "F1.4": "Communication:To:Group não é confiável p/ grupo (ex.: 1.489 vs 6.055 do isGroupMessage:true).",
-            "F1.5": "mediaMime sem wildcard: mediaMime:image/* → 0; usar valor exato (mediaMime:image/jpeg).",
-            "F1.6": "transcrição de áudio fica no doc de mídia (audio:transcription), não na mensagem.",
-            "F1.7": "accountType:WhatsApp inclui não-mensagens (conta, contatos, status, chamadas).",
-            "F1.8": "volume alto (10⁴–10⁵ docs): contagem + amostra, nunca a lista cheia.",
-            "F1.9": "negação Lucene: X -Y AND Z descarta X; usar X AND -Y AND Z, (X -Y) AND Z ou NOT Y.",
-            "F1.10": "@ em valor sem aspas → HTTP 500; usar prefixo numérico (Name:<número>*).",
-            "F1.11": "contentType sem aspas → misparse (1.499.455 docs); valor entre aspas.",
-            "F1.12": "name:WhatsApp é superset (+imagens de perfil, pastas, logs).",
-            "F1.13": "mediaMime multi-valorado (jpeg=webp=png) — não somar.",
-            "F1.14": "contentType não é filtro confiável de mensagem (message/x-whatsapp-message < IM).",
-            "F1.15": "nome de grupo Android com segmento extra: <jid>_0_message_<n>.",
-            "F1.16": "PDF Android não tem linkedItems (sem link mensagem→mídia).",
-            "F1.17": "link mensagem→mídia é unidirecional (linkedItems sha-256 → ufed\\:SHA256).",
-            "F1.18": "min/max por amostra não é o real; usar coleta completa ou busca binária.",
-            "F2.1": "WhatsApp Channels: isGroupMessage:true INCLUI canais; separar grupo×canal só pelo prefixo do name.",
-            "F2.2": "chat privado iPhone com segmento extra _N: <número>_0_message_<n>.",
-            "F2.3": "chat privado Android sem nome: WhatsApp Chat - <número>_message_<n>.",
-            "F2.4": "From/To em 4 formatos (Nome (número) · Nome (JID) · JID puro · ausente).",
-            "F2.5": "msg de grupo sem isGroupMessage (eventos de sistema): contagem por flag subconta; usar name-based.",
-            "F2.6": "range de data date-only no fim trunca o último dia; usar T23:59:59Z.",
-            "F2.7": "@ em valor da query → HTTP 500; usar prefixo numérico Name:<número>*.",
-            "F2.8": "isGroupMessage:true também em chamadas de grupo e 1 contato (só Android); p/ msgs: IM AND isGroupMessage:true.",
-            "F2.9": "artefato WhatsApp Chat - 0_message_N (ex.: 4 docs From:'0'); excluir da contagem real.",
-            "F2.10": "self-chat do dono (Mensagens salvas): entra nas conversas privadas, não vira interlocutor.",
-            "F2.11": "name:<número> casa Status/Chamadas (+1/+poucos); usar name:Chat AND name:<número>.",
-            "F3.1": "doc_text não é buscável via /search; texto de anexo só iterando /text nos PDFs.",
-            "F3.2": "filtro privado bruto inclui eventos de grupo/canal sem a flag; refinar por name prefix WhatsApp Chat - .",
-            "F3.3": "token Lucene ≠ substring (Message-Body:pix ≠ pixeado); a query Lucene é a canônica.",
-            "F3.4": "PDF vazio (size=0) tem /text vazio; filtrar size:[1 TO *].",
-            "F3.5": "imagem tem /text vazio (só quebras de linha); attachment_text só útil p/ PDF/documento.",
-            "F3.6": "name:<número> casa Status; usar name:Chat AND name:<número> p/ conversa privada exata.",
-        },
+        "pitfalls": _reference_pitfalls(),
     }
 
 

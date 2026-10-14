@@ -13,20 +13,26 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Callable
+from typing import Any
 
 import requests
 from fastmcp import FastMCP
 
-from iped_mcp.diagnose import diagnose_500
-from iped_mcp.download import resolve_filename
+from iped_mcp import config, validation
+from iped_mcp.client import TEXT_STATUS_NO_TEXT, TEXT_STATUS_OK, TextResult
+from iped_mcp.diagnose import guarded_call
+from iped_mcp.download import (
+    export_path,
+    pick_export_name,
+    write_bytes_to,
+    write_stream_to,
+)
 from iped_mcp.fetch import text_cache_get, text_cache_set
 from iped_mcp.router import get_router
 
 # Busca genérica pode ser match-all (~66 s no source de teste); timeout padrão
 # (10 s) não basta. Mesma ordem de grandeza de _MATCH_ALL_TIMEOUT em regex/scan.py.
 _SEARCH_TIMEOUT = 120.0
-_CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 _SEARCH_HINT = (
     "Revise a sintaxe Lucene (docstring de iped_search) e os campos de extra_filters."
@@ -59,29 +65,19 @@ def _first(value: object) -> object:
     return value
 
 
-def _guarded(fn: Callable, what: str, hint: str, *args: Any, **kwargs: Any) -> Any:
-    """Executa fn e traduz HTTP 500 / erro de rede em ValueError com diagnóstico."""
-    try:
-        return fn(*args, **kwargs)
-    except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 500:
-            raise ValueError(diagnose_500(what, hint)) from exc
-        raise
-    except requests.ConnectionError as exc:
-        raise ValueError(
-            "Servidor IPED indisponível. Verifique se o IPED está rodando."
-        ) from exc
-    except requests.Timeout as exc:
-        raise ValueError(
-            f"Timeout ao consultar o IPED ({what}). "
-            "Buscas amplas (ex.: match-all) podem demorar; refine a query."
-        ) from exc
+# Tradução de erros: política única em iped_mcp.diagnose.guarded_call (M-2).
 
 
-def _prepare_dest_dir(dest_dir: str) -> tuple[str, bool]:
-    """Valida/cria dest_dir → (caminho absoluto, era absoluto?)."""
+def _prepare_dest_dir(dest_dir: str | None) -> tuple[str, bool]:
+    """Valida/cria dest_dir → (caminho absoluto, era absoluto?).
+
+    M-10 (DESIGN 10): `dest_dir` omitido/vazio resolve contra
+    `config.EXPORTS_DIR` (`IPED_MCP_EXPORTS_DIR`, fonte única de todas as
+    tools de export); o default do operador é tratado como absoluto (não
+    há warning de cwd para configuração de deployment).
+    """
     if not dest_dir:
-        raise ValueError("'dest_dir' não pode ser vazio.")
+        return os.path.abspath(os.path.expanduser(config.EXPORTS_DIR)), True
     is_abs = os.path.isabs(dest_dir)
     target = os.path.abspath(os.path.expanduser(dest_dir))
     try:
@@ -93,15 +89,9 @@ def _prepare_dest_dir(dest_dir: str) -> tuple[str, bool]:
     return target, is_abs
 
 
-def _write_stream(resp: requests.Response, path: str) -> int:
-    """Escreve o stream em path; devolve os bytes gravados."""
-    size = 0
-    with open(path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
-            if chunk:
-                f.write(chunk)
-                size += len(chunk)
-    return size
+def _no_file_payload(source_id: str, doc_id: int, note: str) -> dict[str, Any]:
+    """Payload comum das variantes de 'doc sem arquivo' em `doc_export`."""
+    return {"source": source_id, "doc_id": doc_id, "no_file": True, "note": note}
 
 
 def _doc_name(source_id: str, doc_id: int) -> str | None:
@@ -129,19 +119,47 @@ _SOURCES_TTL = 30.0
 _sources_cache: tuple[float, list[dict[str, Any]]] | None = None
 
 
-def list_sources() -> list[dict[str, Any]]:
-    """Lista os sources registrados no servidor IPED.
+def list_sources() -> dict[str, Any]:
+    """Lista os sources registrados no servidor IPED e reporta servidores mudos.
 
     Comece por aqui para ver os sources disponíveis antes de buscar.
     Cada source tem `id` (use em source_id das outras tools) e `path`.
+    Servidor que não respondeu NÃO aparece em `sources` (não há como listar
+    suas fontes); a falha aparece em `offline_endpoints` como dado — uma
+    lista vazia com servidores offline nunca é silenciosa.
+
+    Returns:
+        {"sources": [{id, path}, ...],
+         "jar_capabilities": {"fork_features_enabled": bool,
+                              "endpoints": [{endpoint, url,
+                                             search_pagination, case_summary,
+                                             properties_fields}, ...]},
+         "offline_endpoints": [{"endpoint": id, "error": motivo}, ...]} —
+         `offline_endpoints` vazio quando todos os servidores responderam.
+         `jar_capabilities` (M-11) reporta as capacidades detectadas no jar
+         de cada endpoint online no startup e o estado do env
+         IPED_MCP_FORK_FEATURES — dado para o agente escolher recursos com
+         segurança; nunca uma exceção.
+
+    Raises:
+        ValueError: falha inesperada de comunicação (taxonomia M-2).
     """
     global _sources_cache
     now = time.monotonic()
     if _sources_cache is not None and now - _sources_cache[0] < _SOURCES_TTL:
         return _sources_cache[1]
-    sources = get_router().list_sources()
-    _sources_cache = (now, sources)
-    return sources
+    router = get_router()
+    sources, failures = router.list_sources_status()
+    result: dict[str, Any] = {
+        "sources": sources,
+        "jar_capabilities": router.capabilities_payload(),
+        "offline_endpoints": [
+            {"endpoint": eid, "error": reason}
+            for eid, reason in sorted(failures.items())
+        ],
+    }
+    _sources_cache = (now, result)
+    return result
 
 
 def search(
@@ -203,14 +221,13 @@ def search(
         )
     if not query or not query.strip():
         raise ValueError("'query' não pode ser vazio.")
-    if not 1 <= limit <= 500:
-        raise ValueError("limit deve estar entre 1 e 500.")
+    validation.check_int_range(limit, "limit", 1, validation.DOCS_LIMIT_MAX)
     parts = [query.strip()]
     if extra_filters:
         parts.extend(f.strip() for f in extra_filters if f and f.strip())
     final_query = " AND ".join(parts)
     client = get_router()
-    results = _guarded(
+    results = guarded_call(
         client.search,
         f"GET /search?q={final_query!r}",
         _SEARCH_HINT,
@@ -255,7 +272,7 @@ def doc_info(
         all: true → properties completo (padrão false).
     """
     client = get_router()
-    doc = _guarded(
+    doc = guarded_call(
         client.get_document,
         f"GET /sources/{source_id}/docs/{doc_id}",
         _DOC_HINT,
@@ -289,8 +306,13 @@ def doc_text(
 
     O endpoint /text pode devolver texto gigante (centenas de KB num doc só),
     então a tool devolve no máximo `max_chars` caracteres a partir de `offset`.
-    Use `next_offset` do retorno para ler o próximo pedaço. Doc sem texto
-    extraível → no_text=true (binário: use iped_doc_export).
+    Use `next_offset` do retorno para ler o próximo pedaço.
+
+    Estados (DESIGN 08 / M-8 — status como dado, nunca exceção):
+    `status="ok"` com `text`; ou `status="no_text"` (+ `no_text=true`)
+    quando o IPED não devolve texto (HTTP 500 do fork — doc binário: use
+    iped_doc_export) ou devolve corpo vazio. `capped=true` marca texto
+    truncado no teto de leitura do cliente (`IPED_MCP_TEXT_CAP`, 10 MB).
 
     Args:
         source_id: source no IPED (veja iped_list_sources).
@@ -298,73 +320,132 @@ def doc_text(
         max_chars: máximo de caracteres a devolver (padrão 20000, teto 100000).
         offset: caractere inicial (paginação; padrão 0).
     """
-    if not 1 <= max_chars <= 100000:
-        raise ValueError("max_chars deve estar entre 1 e 100000.")
-    if offset < 0:
-        raise ValueError("offset deve ser >= 0.")
-    cached = text_cache_get(source_id, doc_id)
-    if cached is not None:
-        text, total_chars, capped = cached
-    else:
-        # _guarded preserva o diagnóstico de erro (500 → ValueError); o cache
-        # só armazena resultados bem-sucedidos.
+    validation.check_int_range(max_chars, "max_chars", 1, validation.MAX_CHARS_MAX)
+    validation.check_min(offset, "offset", 0)
+    read = text_cache_get(source_id, doc_id)
+    if read is None:
+        # guarded_call continua traduzindo falhas reais (rede, 404, rede
+        # viva com erro); o 500 de "sem texto" já chega como estado
+        # no_text do cliente e o cache também o armazena (barato re-usar).
         client = get_router()
-        text, total_chars, capped = _guarded(
+        read = guarded_call(
             client.get_document_text,
             f"GET /sources/{source_id}/docs/{doc_id}/text",
             _DOC_HINT,
             source_id,
             doc_id,
         )
-        text_cache_set(source_id, doc_id, (text, total_chars, capped))
-    if not text.strip():
-        return {
-            "source": source_id,
-            "doc_id": doc_id,
-            "no_text": True,
-            "note": "doc sem texto extraível; use iped_doc_export para o arquivo bruto.",
-        }
-    segment = text[offset : offset + max_chars]
+        text_cache_set(source_id, doc_id, read)
+    if read.status == TEXT_STATUS_NO_TEXT:
+        return _doc_text_no_text(
+            source_id,
+            doc_id,
+            "doc sem texto extraível (o IPED não devolve texto p/ este doc); "
+            "use iped_doc_export para o arquivo bruto.",
+        )
+    return _doc_text_segment(read, source_id, doc_id, max_chars, offset)
+
+
+def _doc_text_segment(
+    read: TextResult, source_id: str, doc_id: int, max_chars: int, offset: int
+) -> dict[str, Any]:
+    """Monta o payload da janela [offset, offset+max_chars) de uma leitura ok.
+
+    Args:
+        read: ``TextResult`` do cliente (status ok; no_text tratado antes).
+        source_id: source no IPED.
+        doc_id: id do documento.
+        max_chars: máximo de caracteres da janela.
+        offset: caractere inicial da janela.
+
+    Returns:
+        Payload `status ok` com paginação; `no_text` quando o corpo é vazio
+        (HTTP 200 sem texto) ou o offset está além do fim — com capped sempre
+        presente (DESIGN 08 / M-8).
+    """
+    if not read.text.strip():
+        return _doc_text_no_text(
+            source_id,
+            doc_id,
+            "texto extraído vazio (HTTP 200 sem corpo); "
+            "use iped_doc_export para o arquivo bruto.",
+        )
+    segment = read.text[offset : offset + max_chars]
     if not segment:
-        return {
-            "source": source_id,
-            "doc_id": doc_id,
-            "no_text": True,
-            "note": f"offset {offset} além do fim do texto (total_chars={total_chars}).",
-        }
-    truncated = (offset + max_chars) < total_chars
+        return _doc_text_no_text(
+            source_id,
+            doc_id,
+            f"offset {offset} além do fim do texto (total_chars={read.total_chars}).",
+        )
+    truncated = (offset + max_chars) < read.total_chars
     result: dict[str, Any] = {
         "source": source_id,
         "doc_id": doc_id,
+        "status": TEXT_STATUS_OK,
         "text": segment,
-        "total_chars": total_chars,
+        "total_chars": read.total_chars,
         "offset": offset,
         "truncated": truncated,
         "next_offset": (offset + max_chars) if truncated else None,
+        "capped": read.capped,
     }
-    if capped:
-        result["capped"] = True
+    if read.capped:
         result["note"] = (
-            "texto truncado no teto de leitura (10 MB); total_chars é piso."
+            f"texto truncado no teto de leitura ({read.total_bytes} bytes "
+            "lidos, IPED_MCP_TEXT_CAP); total_chars é piso."
         )
     return result
 
 
-def doc_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
-    """Salva o arquivo bruto de um documento em dest_dir (binário nunca entra em contexto).
+def _doc_text_no_text(source_id: str, doc_id: int, note: str) -> dict[str, Any]:
+    """Retorno canônico do estado no_text (DESIGN 08 / M-8 — status como dado).
+
+    Args:
+        source_id: source no IPED.
+        doc_id: id do documento.
+        note: explicação do sub-estado (sem texto no servidor, corpo vazio
+            ou offset além do fim) — os três preservam status no_text.
+
+    Returns:
+        Payload com status no_text, marcador legado no_text=true e capped=False.
+    """
+    return {
+        "source": source_id,
+        "doc_id": doc_id,
+        "status": TEXT_STATUS_NO_TEXT,
+        "no_text": True,
+        "capped": False,
+        "note": note,
+    }
+
+
+def doc_export(
+    source_id: str,
+    doc_id: int,
+    dest_dir: str | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Salva o arquivo bruto de um documento (binário nunca entra em contexto).
 
     O conteúdo é baixado em streaming para o disco; a tool devolve o path do
-    arquivo salvo (não os bytes). Filename do header Content-Disposition →
+    arquivo salvo (não os bytes). Nome do artefato (M-10):
+    `<UTC-ts>_<source>_<nome>` — uma reexecução NUNCA sobrescreve o export
+    anterior (colisão ganha sufixo `-N`; `overwrite=True` é a opt-in
+    explícita). A extensão segue o Content-Type real (P1-3) quando há mapa;
+    sem mapa vale a do nome. Filename do header Content-Disposition →
     fallback prop name → doc_{id}. Doc sem arquivo → no_file=true.
 
     Args:
         source_id: source no IPED (veja iped_list_sources).
         doc_id: id do documento (ex.: vindo de iped_search).
-        dest_dir: pasta de destino (recomendado: caminho absoluto; criada se não existir).
+        dest_dir: pasta de destino (recomendado: caminho absoluto; criada se
+            não existir; omissão usa `$IPED_MCP_EXPORTS_DIR`).
+        overwrite: True permite reescrever o MESMO arquivo na reexecução
+            (default False: artefato anterior é intocável — AC1/M-10).
     """
     target, is_abs = _prepare_dest_dir(dest_dir)
     client = get_router()
-    header_filename, resp = _guarded(
+    header_filename, resp = guarded_call(
         client.get_document_content,
         f"GET /sources/{source_id}/docs/{doc_id}/content",
         _DOC_HINT,
@@ -375,29 +456,24 @@ def doc_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
         with resp:
             if resp.headers.get("Content-Length") == "0":
                 return _relative_warning(
-                    {
-                        "source": source_id,
-                        "doc_id": doc_id,
-                        "no_file": True,
-                        "note": "doc sem arquivo (ex.: Device Information).",
-                    },
+                    _no_file_payload(
+                        source_id, doc_id, "doc sem arquivo (ex.: Device Information)."
+                    ),
                     is_abs,
                     dest_dir,
                 )
             doc_name = _doc_name(source_id, doc_id) if not header_filename else None
-            used: set[str] = set()
-            filename = resolve_filename(doc_id, header_filename, doc_name, used)
-            path = os.path.join(target, filename)
-            size = _write_stream(resp, path)
+            base = pick_export_name(doc_id, header_filename, doc_name)
+            path = export_path(
+                target, source_id, base,
+                content_type=resp.headers.get("Content-Type"),
+                overwrite=overwrite,
+            )
+            size = write_stream_to(path, resp)
             if size == 0:
                 os.remove(path)
                 return _relative_warning(
-                    {
-                        "source": source_id,
-                        "doc_id": doc_id,
-                        "no_file": True,
-                        "note": "doc sem arquivo (body vazio).",
-                    },
+                    _no_file_payload(source_id, doc_id, "doc sem arquivo (body vazio)."),
                     is_abs,
                     dest_dir,
                 )
@@ -406,7 +482,7 @@ def doc_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
                     "source": source_id,
                     "doc_id": doc_id,
                     "path": path,
-                    "filename": filename,
+                    "filename": os.path.basename(path),
                     "size": size,
                 },
                 is_abs,
@@ -418,21 +494,30 @@ def doc_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
         ) from exc
 
 
-def thumb_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
-    """Salva a thumbnail (JPEG 96x72) de um documento em dest_dir (binário nunca entra em contexto).
+def thumb_export(
+    source_id: str,
+    doc_id: int,
+    dest_dir: str | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Salva a thumbnail (JPEG 96x72) de um documento (binário nunca entra em contexto).
 
-    A thumbnail é baixada em streaming para o disco; a tool devolve o path do
-    arquivo salvo. Nome: {name}_thumb.jpg (fallback doc_{id}_thumb.jpg).
-    Doc sem imagem → no_thumb=true.
+    A thumbnail é baixada para o disco; a tool devolve o path do arquivo
+    salvo. Nome (M-10): `<UTC-ts>_<source>_<name>_thumb.jpg`
+    (fallback doc_{id}_thumb.jpg); reexecução nunca sobrescreve (colisão
+    → `-N`; `overwrite=True` é a opt-in explícita). Doc sem imagem →
+    no_thumb=true.
 
     Args:
         source_id: source no IPED (veja iped_list_sources).
         doc_id: id do documento (ex.: vindo de iped_search).
-        dest_dir: pasta de destino (recomendado: caminho absoluto; criada se não existir).
+        dest_dir: pasta de destino (recomendado: caminho absoluto; criada se
+            não existir; omissão usa `$IPED_MCP_EXPORTS_DIR`).
+        overwrite: True permite reescrever o MESMO arquivo na reexecução.
     """
     target, is_abs = _prepare_dest_dir(dest_dir)
     client = get_router()
-    resp = _guarded(
+    resp = guarded_call(
         client.get_document_thumb,
         f"GET /sources/{source_id}/docs/{doc_id}/thumb",
         _DOC_HINT,
@@ -455,16 +540,16 @@ def thumb_export(source_id: str, doc_id: int, dest_dir: str) -> dict[str, Any]:
                 )
             name = _doc_name(source_id, doc_id)
             base = os.path.basename(str(name)) if name else f"doc_{doc_id}"
-            filename = f"{base}_thumb.jpg"
-            path = os.path.join(target, filename)
-            with open(path, "wb") as f:
-                f.write(data)
+            path = export_path(
+                target, source_id, f"{base}_thumb", ext=".jpg", overwrite=overwrite
+            )
+            write_bytes_to(path, data)
             return _relative_warning(
                 {
                     "source": source_id,
                     "doc_id": doc_id,
                     "path": path,
-                    "filename": filename,
+                    "filename": os.path.basename(path),
                     "size": len(data),
                 },
                 is_abs,

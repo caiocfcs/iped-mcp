@@ -3,15 +3,13 @@ import sys
 
 from fastmcp import FastMCP
 
+from iped_mcp import config
 from iped_mcp.bookmarks import register as register_bookmarks
 from iped_mcp.core import register as register_core
 from iped_mcp.regex import register as register_regex
 from iped_mcp.router import RouterStartupError, get_router
 from iped_mcp.ufed import register as register_ufed
 from iped_mcp.whatsapp import register as register_whatsapp
-
-HOST = "127.0.0.1"
-PORT = 8000
 
 mcp = FastMCP(
     "iped_mcp",
@@ -22,6 +20,8 @@ mcp = FastMCP(
         "(devolve contagem + amostra de IDs), iped_doc_info mostra propriedades, "
         "iped_doc_text lê o texto (truncado), iped_doc_export/iped_thumb_export "
         "baixam arquivo bruto/thumbnail para o disco. "
+        "Antes de refinar buscas, iped_case_summary faz o censo por categoria "
+        "de um source (contagens e avisos; nenhum id de documento na resposta). "
         "Para atributos ufed: (IMEI, ICCID, etc.), use ufed_search ou ufed_device_info; "
         "ufed_list_fields mostra os campos válidos. "
         "Para atributos Regex:* (CNPJ, CPF, URL, etc.), comece com regex_list_types; "
@@ -60,7 +60,7 @@ def main() -> None:
     except RouterStartupError as exc:
         print(f"IPED MCP: {exc}", file=sys.stderr)
         sys.exit(1)
-    mcp.run(transport="http", host=HOST, port=PORT)
+    mcp.run(transport="http", host=config.SERVER_HOST, port=config.SERVER_PORT)
 
 
 if __name__ == "__main__":
