@@ -21,3 +21,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/iped_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "runtime: smoke opcional GET-only contra WebAPI real via $IPED_URL (skip sem a variavel)",
+    "characterization: pino do comportamento atual que M-2/M-8 trocarao deliberadamente",
+]

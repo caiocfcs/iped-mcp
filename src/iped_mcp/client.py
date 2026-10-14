@@ -1,56 +1,496 @@
-"""Cliente para a API REST do IPED."""
+"""Cliente para a API REST do IPED.
+
+Toda falha de rede/HTTP é traduzida na fronteira deste módulo para as
+classes de `iped_mcp.errors` (política única de erro, DESIGN 02): as
+camadas internas nunca veem exceções `requests` cruas nem o texto
+"404 Client Error: ... for url: ...".
+
+Toda requisição passa pela política de resiliência do DESIGN 03 (M-3):
+retry ×3 com backoff 2^n somente para falhas transitórias (conexão,
+timeout, 5xx — nunca 4xx; mutações só em falha de conexão pré-resposta)
+e circuit breaker por base_url com sonda `GET /sources/`. Como o cliente
+é um por endpoint, o breaker "por base_url" é naturalmente um por
+instância. O teto de tempo de uma chamada é
+`tentativas × timeout + backoffs` (ver `iped_mcp.resilience`).
+
+Timeouts são por classe de operação (DESIGN 04 / M-4): busca, props,
+texto e download têm teto próprio, definido em `iped_mcp.config` e
+ajustável por env (`IPED_MCP_TIMEOUT_*`) sem tocar código.
+
+No `/text`, o HTTP 500 do jar-alvo é o contrato de "documento sem texto
+extraído" (WONT_FIX permanente do fork, P2-5): `get_document_text` o
+traduz em ESTADO (`TextResult.status = no_text`), não em exceção
+(DESIGN 08 / M-8 — padrão do icaro, iped_client.py:233-244).
+"""
 
 from __future__ import annotations
 
-import os
-from typing import Any
+import logging
+import time
+from typing import Any, Callable, NamedTuple
 from urllib.parse import quote
 
 import requests
 from requests.adapters import HTTPAdapter
-from dotenv import load_dotenv
 
-from iped_mcp.config import WORKERS
+from iped_mcp import config
+from iped_mcp.errors import (
+    IpedConnectionError,
+    IpedError,
+    IpedHTTPError,
+    IpedResponseError,
+    ServerError,
+    error_for_response,
+    response_not_readable_message,
+    server_unavailable_text,
+    translate_network_error,
+)
+from iped_mcp.resilience import CircuitBreaker, RetryPolicy
 
-load_dotenv()
+logger = logging.getLogger("iped_mcp.client")
 
-DEFAULT_IPED_URL = os.environ.get("IPED_URL", "http://localhost:1234")
-# Timeout de leitura (entre bytes) para download de arquivos; arquivos grandes
-# em conexões lentas podem levar mais que o timeout padrão.
-_CONTENT_READ_TIMEOUT = 120.0
-# Teto de leitura do /text (chunked, sem Content-Length): evita estourar memória
-# em docs com texto extraído gigante. Acima disso, capped=True.
-_TEXT_READ_CAP = 10 * 1024 * 1024  # 10 MB
+# M-17: o .env é carregado UMA unica vez por iped_mcp.config (import acima)
+# e o default de endereco da WebAPI tambem vem de la (config.IPED_URL).
 # Pool de conexões casado com o paralelismo de fetch (config.WORKERS): com o
 # pool padrão (10), workers > 10 descartam conexões ("pool is full") e parte
 # dos requests paga um novo handshake TCP. +8 de folga p/ buscas concorrentes.
-_POOL_SIZE = WORKERS + 8
+_POOL_SIZE = config.WORKERS + 8
+# Tamanho do chunk de leitura do /text (iter_content).
+_TEXT_CHUNK_SIZE = 65536
+
+# Estados do /text devolvidos como DADO (DESIGN 08 / M-8). No jar-alvo o
+# HTTP 500 marca "documento sem texto extraído" — WONT_FIX permanente do
+# fork (P2-5, /iped-research/BACKLOG.md:33-34); o MCP traduz o 500 desta
+# rota em estado, como o icaro já faz (iped_client.py:233-244).
+TEXT_STATUS_OK = "ok"
+TEXT_STATUS_NO_TEXT = "no_text"
+
+# M-13: percent-encoding de QUALQUER id embutido em path (fonte unica).
+# '@' fica cru porque e o caractere dos ids reais de source (e-mails,
+# 2d 00-sources.json): o quote() default o escaparia para %40 e mudaria
+# byte-a-byte a URL de todo uso atual. '/' NAO entra em safe: um '/'
+# dentro de um id jamais podera virar dois segmentos de path.
+_ID_PATH_SAFE_CHARS = "@"
+
+
+def _quote_path_id(value: object) -> str:
+    """Codifica um id cru para segmento de path da WebAPI (M-13, fonte unica).
+
+    Toda montagem de path do cliente passa por esta funcao: uma unica
+    aplicacao de ``urllib.parse.quote`` por id. Nao existe dupla escapagem
+    interna porque (1) os ids nascem crus no JSON da WebAPI (``/sources``,
+    ``/search``) e (2) o requests nao re-codifica sequencias ``%XX`` ja
+    presentes no path (``requote_uri`` trata ``%`` como seguro), entao a
+    URL final contem exatamente a codificacao produzida aqui.
+
+    Args:
+        value: identificador cru (``source_id``, ``doc_id`` ou nome de
+            bookmark; inteiros sao aceitos para ``doc_id``).
+
+    Returns:
+        Id apto a interpolar no path: o alfabeto observado na 2d (letras,
+        digitos, ``.``, ``-``, ``_``, ``@``) sai byte-a-byte identico;
+        espaco vira ``%20``, ``%`` literal vira ``%25`` e acentos viram
+        sequencias UTF-8 (``cafe`` acentuado -> ``%C3%A9``).
+    """
+    return quote(str(value), safe=_ID_PATH_SAFE_CHARS)
+
+
+def _doc_path(source_id: object, doc_id: object, subview: str = "") -> str:
+    """Monta `sources/{sid}/docs/{did}[/{subview}]` com os ids codificados.
+
+    Args:
+        source_id: source do doc (cru).
+        doc_id: id do doc (cru; inteiro aceito).
+        subview: sub-visao final (``content``, ``text``, ``thumb``) ou ""
+            para o doc completo (endpoint #3).
+
+    Returns:
+        Caminho relativo pronto para ``_request`` — a codificacao acontece
+        so aqui; o destino NUNCA deve re-quotear.
+    """
+    base = f"sources/{_quote_path_id(source_id)}/docs/{_quote_path_id(doc_id)}"
+    return f"{base}/{subview}" if subview else base
+
+
+class TextResult(NamedTuple):
+    """Resultado de uma leitura de /text — status como dado (DESIGN 08 / M-8).
+
+    Os três primeiros campos preservam o contrato ``tuple[str, int, bool]``
+    legado (``text, total_chars, capped``) para os consumidores que já
+    destravam/de indexam o trio (ex.: ``fetch.get_document_text``); o
+    estado viaja no quarto campo.
+
+    Attributes:
+        text: texto lido (vazio quando ``status`` é ``no_text``).
+        total_chars: caracteres decodificados (piso quando ``capped``).
+        capped: a leitura parou no teto de bytes.
+        status: ``TEXT_STATUS_OK`` ou ``TEXT_STATUS_NO_TEXT``.
+        total_bytes: bytes lidos do stream (piso quando ``capped``).
+    """
+
+    text: str
+    total_chars: int
+    capped: bool
+    status: str = TEXT_STATUS_OK
+    total_bytes: int = 0
+
+
+
+def _resolve_base_url(base_url: str | None) -> str:
+    """Resolve a URL base do cliente a partir do argumento ou do config.
+
+    Args:
+        base_url: URL informada pelo chamador; None pede o default do
+            ambiente (`config.IPED_URL`, env `IPED_URL`) -- fonte unica
+            M-17, resolvida na construcao e nao no import.
+
+    Returns:
+        A URL base sem barra final.
+    """
+    return (config.IPED_URL if base_url is None else base_url).rstrip("/")
 
 
 class IPEDClient:
-    """Cliente para a API REST do IPED."""
+    """Cliente para a API REST do IPED (um endpoint/base_url).
 
-    def __init__(self, base_url: str = DEFAULT_IPED_URL, timeout: float = 10) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self._session = requests.Session()
-        adapter = HTTPAdapter(
-            pool_connections=_POOL_SIZE, pool_maxsize=_POOL_SIZE
+    Superfície inalterada para os chamadores; retry, circuit breaker e a
+    tradução de erro são transparentes (DESIGN 02 + DESIGN 03).
+    """
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        timeout: float | None = None,
+        *,
+        session: requests.Session | None = None,
+        sleeper: Callable[[float], None] | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        """Cria o cliente com pool de conexões e política de resiliência.
+
+        Args:
+            base_url: URL base da WebAPI (sem barra final); None usa
+                `config.IPED_URL` (env `IPED_URL`, default do baseline
+                `http://localhost:1234`) resolvido na construcao (M-17).
+            timeout: override explícito único para todas as classes (usado em
+                teste/diagnóstico); None = cada método usa a sua classe de
+                timeout definida em `iped_mcp.config` (DESIGN 04).
+            session: sessão requests (injeção para teste); por padrão cria
+                uma com pool dimensionado para o fetch paralelo.
+            sleeper: função de espera do backoff (injeção para teste);
+                padrão `time.sleep`, resolvido na construção.
+            clock: relógio monotônico do circuit breaker (injeção p/ teste);
+                padrão `time.monotonic`, resolvido na construção.
+        """
+        self.base_url = _resolve_base_url(base_url)
+        # Classes de timeout resolvidas na construção a partir do config; o
+        # parâmetro `timeout`, quando dado, sobrepõe todas (override único).
+        ov = timeout
+        self.timeout = config.TIMEOUT_DEFAULT if ov is None else ov
+        self._search_timeout = config.TIMEOUT_SEARCH if ov is None else ov
+        self._props_timeout = config.TIMEOUT_PROPS if ov is None else ov
+        self._text_timeout = config.TIMEOUT_TEXT if ov is None else ov
+        # Par (connect, read) dos endpoints de download (content/thumb).
+        self._download_timeout = (
+            config.TIMEOUT_CONNECT_DOWNLOAD if ov is None else ov,
+            config.TIMEOUT_READ_DOWNLOAD if ov is None else ov,
         )
-        self._session.mount("http://", adapter)
-        self._session.mount("https://", adapter)
+        if session is None:
+            session = requests.Session()
+            adapter = HTTPAdapter(
+                pool_connections=_POOL_SIZE, pool_maxsize=_POOL_SIZE
+            )
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+        self._session = session
+        # Defaults de tempo resolvidos na construção (via atributo do
+        # módulo): permite ao conftest zerar o backoff da suíte sem tocar
+        # nos testes que injetam sleeper/clock próprios.
+        self._retry_policy = RetryPolicy(
+            sleep=sleeper if sleeper is not None else time.sleep
+        )
+        self._breaker = CircuitBreaker(
+            name=self.base_url,
+            probe=self._probe_endpoint,
+            clock=clock if clock is not None else time.monotonic,
+        )
 
-    def _get(self, path: str, timeout: float | None = None, **kwargs: Any) -> dict[str, Any]:
+    # --- fronteira única de tradução de erro (DESIGN 02) ----------------------
+    # --- e única aplicação da política de resiliência (DESIGN 03) -------------
+
+    def _probe_endpoint(self) -> bool:
+        """Sonda de vida do breaker: `GET /sources/` com timeout curto (M-3).
+
+        Bypassa deliberadamente o retry e o circuito — ela É a decisão de
+        reabertura (padrão ping do icaro, iped_client.py:65-73).
+
+        Returns:
+            True se o servidor respondeu HTTP 200.
+        """
+        try:
+            resp = self._session.request(
+                "GET",
+                f"{self.base_url}/sources/",
+                timeout=config.CB_PROBE_TIMEOUT_SECONDS,
+            )
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: float | tuple[float, float] | None = None,
+        source_id: str | None = None,
+        doc_id: int | None = None,
+        retry_server_errors: bool = True,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Executa a requisição sob a política de resiliência e traduz falhas.
+
+        Circuito aberto → falha rápida, sem tocar a rede. Fechado → até
+        `RetryPolicy.max_attempts` tentativas para falhas transitórias
+        (nunca 4xx; mutações só em falha de conexão pré-resposta).
+
+        Args:
+            method: verbo HTTP ("GET", "POST", "PUT", "DELETE").
+            path: caminho relativo à base_url.
+            timeout: segundos, ou par (connect, read); ausente → `self.timeout`
+                (override do construtor ou default das operações curtas).
+            source_id: source envolvida (contexto da mensagem de erro).
+            doc_id: doc envolvido; marca endpoint de documento, onde o
+                jar-alvo responde 500 para doc inexistente (2d 10).
+            retry_server_errors: False em rotas cujo 5xx é determinístico
+                (`search`: query rejeitada → diagnóstico imediato, AC4).
+            **kwargs: repassados ao requests (params, json...).
+
+        Returns:
+            A resposta, quando o status é < 400.
+
+        Raises:
+            IpedConnectionError: servidor não respondeu (offline/recusa) ou
+                circuito aberto (fail-fast).
+            IpedTimeoutError: servidor não respondeu a tempo.
+            IpedHTTPError: status >= 400 (subclasse por classe de status).
+        """
         url = f"{self.base_url}/{path.lstrip('/')}"
-        resp = self._session.get(
-            url, timeout=timeout if timeout is not None else self.timeout, **kwargs
+        self._breaker.guard()
+        return self._execute_with_retry(
+            method,
+            url,
+            timeout=timeout if timeout is not None else self.timeout,
+            source_id=source_id,
+            doc_id=doc_id,
+            retry_server_errors=retry_server_errors,
+            **kwargs,
         )
-        resp.raise_for_status()
-        return resp.json()
+
+    def _execute_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        timeout: float | tuple[float, float],
+        source_id: str | None,
+        doc_id: int | None,
+        retry_server_errors: bool,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Loop de tentativas com backoff; a decisão é do `RetryPolicy`.
+
+        Args:
+            method: verbo HTTP.
+            url: URL absoluta da requisição.
+            timeout: segundos ou par (connect, read).
+            source_id: source envolvida (contexto do erro).
+            doc_id: doc envolvido (contexto do erro).
+            retry_server_errors: ver `_request`.
+            **kwargs: repassados ao requests.
+
+        Returns:
+            A resposta da primeira tentativa bem-sucedida (< 400).
+
+        Raises:
+            IpedError: a última falha traduzida, esgotadas as tentativas,
+                ou a primeira falha não re-tentável.
+        """
+        last_exc: IpedError | None = None
+        for attempt in range(self._retry_policy.max_attempts):
+            try:
+                resp = self._attempt(
+                    method,
+                    url,
+                    timeout=timeout,
+                    source_id=source_id,
+                    doc_id=doc_id,
+                    **kwargs,
+                )
+            except IpedError as exc:
+                if isinstance(exc, IpedHTTPError):
+                    # O servidor RESPONDEU (mesmo com erro): rede viva p/
+                    # o breaker — só falha de conexão pontua (icaro :93).
+                    self._breaker.record_success()
+                if not self._retry_policy.should_retry(
+                    exc, method, retry_server_errors=retry_server_errors
+                ):
+                    raise
+                last_exc = exc
+                logger.warning(
+                    "Tentativa %d/%d falhou em %s (%s); re-tentando.",
+                    attempt + 1,
+                    self._retry_policy.max_attempts,
+                    url,
+                    exc,
+                )
+                if attempt + 1 < self._retry_policy.max_attempts:
+                    self._retry_policy.sleep(self._retry_policy.backoff(attempt))
+            else:
+                self._breaker.record_success()
+                return resp
+        if last_exc is None:  # defensivo: max_attempts >= 1 garante exceção
+            raise IpedConnectionError(server_unavailable_text(), url=url)
+        if isinstance(last_exc, IpedConnectionError):
+            # Esgotou por falha de conexão: única classe que pontua o breaker.
+            self._breaker.record_connection_failure()
+        raise last_exc
+
+    def _attempt(
+        self,
+        method: str,
+        url: str,
+        *,
+        timeout: float | tuple[float, float],
+        source_id: str | None,
+        doc_id: int | None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Uma tentativa HTTP: resposta < 400 ou erro da taxonomia (M-2).
+
+        Args:
+            method: verbo HTTP.
+            url: URL absoluta.
+            timeout: segundos ou par (connect, read).
+            source_id: source envolvida (contexto do erro).
+            doc_id: doc envolvido (contexto do erro).
+            **kwargs: repassados ao requests.
+
+        Returns:
+            A resposta com status < 400.
+
+        Raises:
+            IpedError: falha de rede ou status >= 400, já traduzidos.
+        """
+        try:
+            resp = self._session.request(method, url, timeout=timeout, **kwargs)
+        except requests.RequestException as exc:
+            raise translate_network_error(exc, url=url, source_id=source_id) from exc
+        if resp.status_code >= 400:
+            raise error_for_response(resp, url=url, source_id=source_id, doc_id=doc_id)
+        return resp
+
+    @staticmethod
+    def _json(resp: requests.Response) -> Any:
+        """Decodifica o corpo JSON; corpo ilegável vira `IpedResponseError`.
+
+        Args:
+            resp: resposta 2xx do servidor.
+
+        Returns:
+            O payload JSON decodificado.
+
+        Raises:
+            IpedResponseError: corpo 2xx sem JSON legível (classe sem-texto).
+        """
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise IpedResponseError(
+                response_not_readable_message(resp.url), url=resp.url
+            ) from exc
+
+    def _get(
+        self,
+        path: str,
+        *,
+        timeout: float | tuple[float, float] | None = None,
+        source_id: str | None = None,
+        doc_id: int | None = None,
+        retry_server_errors: bool = True,
+        **kwargs: Any,
+    ) -> Any:
+        """GET + JSON com tradução centralizada e resiliência (ver `_request`).
+
+        Args:
+            path: caminho relativo à base_url.
+            timeout: segundos ou par (connect, read).
+            source_id: source envolvida (contexto do erro).
+            doc_id: doc envolvido (contexto do erro).
+            retry_server_errors: ver `_request`.
+            **kwargs: repassados ao requests.
+
+        Returns:
+            O payload JSON da resposta.
+
+        Raises:
+            IpedError: qualquer falha de comunicação (classes da taxonomia).
+        """
+        resp = self._request(
+            "GET",
+            path,
+            timeout=timeout,
+            source_id=source_id,
+            doc_id=doc_id,
+            retry_server_errors=retry_server_errors,
+            **kwargs,
+        )
+        return self._json(resp)
+
+    # --- superfície pública -----------------------------------------------------
 
     def list_sources(self, timeout: float | None = None) -> list[dict[str, Any]]:
-        """Lista os sources registrados no servidor IPED."""
+        """Lista os sources registrados no servidor IPED.
+
+        Args:
+            timeout: timeout desta chamada (padrão do cliente se None).
+
+        Returns:
+            Lista de sources (dicts com `id` e `path`).
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
+        """
         return self._get("sources/", timeout=timeout)["data"]
+
+    def get_categories(self, source_id: str | None = None) -> list[str]:
+        """Taxonomia real de categorias do endpoint (GET /categories).
+
+        O endpoint é por servidor (não por source): `source_id` entra só
+        como contexto do erro. Envelope `{"data": [...]}` — contrato
+        pinado pelo uso no ICARO (iped_client.py:194-196).
+
+        Args:
+            source_id: source envolvida (apenas contexto do erro).
+
+        Returns:
+            Nomes de categoria na ordem do servidor.
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`);
+                jar sem o endpoint chega como `ResourceNotFoundError`
+                (HTTP 404 — builds sem /categories, cf. 2d dos
+                endpoints ausentes).
+            IpedResponseError: resposta sem a lista `data`.
+        """
+        payload = self._get("categories", source_id=source_id)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            raise IpedResponseError(
+                f"Resposta de /categories sem a lista 'data' (source '{source_id}')."
+            )
+        return [str(name) for name in data]
 
     def search(
         self,
@@ -58,68 +498,157 @@ class IPEDClient:
         source_id: str | None = None,
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Busca documentos por query Lucene, opcionalmente restrita a um source."""
+        """Busca documentos por query Lucene, opcionalmente restrita a um source.
+
+        O 500 do /search é determinístico (query rejeitada pelo servidor),
+        por isso NÃO é re-tentado: re-tentar a mesma query só custaria o
+        backoff antes do mesmo diagnóstico (AC4; 500-imediato do fetch).
+
+        Args:
+            query: query Lucene.
+            source_id: source a restringir a busca (None = todos do servidor).
+            timeout: timeout desta chamada; None = classe de busca
+                (`TIMEOUT_SEARCH`, 30 s default — DESIGN 04).
+
+        Returns:
+            Grupos [{source, ids}] — sem paginação server-side (WI-1).
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
+        """
         params: dict[str, str] = {"q": query}
         if source_id:
             params["sourceID"] = source_id
-        return self._get("search", params=params, timeout=timeout)["data"]
+        return self._get(
+            "search",
+            params=params,
+            timeout=timeout if timeout is not None else self._search_timeout,
+            source_id=source_id,
+            retry_server_errors=False,
+        )["data"]
 
     def get_document(self, source_id: str, doc_id: int) -> dict[str, Any]:
-        """Retorna o documento (incluindo `properties`)."""
-        return self._get(f"sources/{source_id}/docs/{doc_id}")
+        """Retorna o documento (incluindo `properties`).
+
+        Timeout da classe props (`TIMEOUT_PROPS`, 90 s default): responder o
+        doc completo pode reabrir SQLite/Media.tar no servidor (DESIGN 04).
+
+        Args:
+            source_id: source do doc.
+            doc_id: id do doc.
+
+        Returns:
+            Doc completo (properties no topo; contrato do endpoint #3).
+
+        Raises:
+            IpedError: falha de rede/HTTP; 404/500 de doc inexistente chegam
+                como `ResourceNotFoundError`/`ServerError` com prefixo
+                "Doc não encontrado".
+        """
+        return self._get(
+            _doc_path(source_id, doc_id),
+            timeout=self._props_timeout,
+            source_id=source_id,
+            doc_id=doc_id,
+        )
 
     # --- Bookmarks (marcadores) ---
     # Tudo dá HTTP 200; mutações (POST/PUT/DELETE) retornam body vazio —
-    # checar status_code, nunca resp.json(). Nomes com espaço exigem quote().
+    # checar status_code, nunca resp.json(). Nomes passam por _quote_path_id
+# (M-13, fonte unica — mesma codificacao das rotas de doc).
+    # Resiliência (M-3): mutações só re-tentam falha de CONEXÃO (pré-resposta);
+    # timeout/5xx em mutação = resposta ambígua → sobe na hora.
 
     def list_bookmarks(self) -> list[str]:
-        """Lista os nomes dos bookmarks."""
+        """Lista os nomes dos bookmarks.
+
+        Returns:
+            Nomes de bookmark do servidor.
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
+        """
         return self._get("bookmarks")["data"]
 
     def get_bookmark_docs(self, bookmark: str) -> list[dict[str, Any]]:
         """Docs do bookmark agrupados por source: [{"source": ..., "ids": [...]}].
 
-        Bookmark inexistente → [] (HTTP 200).
+        Args:
+            bookmark: nome do bookmark.
+
+        Returns:
+            Grupos de docs; bookmark inexistente → [] (HTTP 200).
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
         """
-        return self._get(f"bookmarks/{quote(bookmark)}")["data"]
+        return self._get(f"bookmarks/{_quote_path_id(bookmark)}")["data"]
 
     def create_bookmark(self, name: str) -> None:
-        """Cria um bookmark vazio (POST, body vazio). Não erroa se já existe."""
-        self._session.post(
-            f"{self.base_url}/bookmarks/{quote(name)}", timeout=self.timeout
-        ).raise_for_status()
+        """Cria um bookmark vazio (POST, body vazio). Não erroa se já existe.
+
+        Args:
+            name: nome do bookmark.
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
+        """
+        self._request("POST", f"bookmarks/{_quote_path_id(name)}")
 
     def add_to_bookmark(self, bookmark: str, docs: list[dict[str, Any]]) -> None:
         """Adiciona docs ao bookmark. docs: [{"source": str, "id": int}].
 
-        Doc inexistente é ignorado silenciosamente.
+        Doc inexistente é ignorado silenciosamente pelo servidor.
+
+        Args:
+            bookmark: nome do bookmark.
+            docs: pares {source, id} a adicionar.
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
         """
-        self._session.put(
-            f"{self.base_url}/bookmarks/{quote(bookmark)}/add",
-            json=docs,
-            timeout=self.timeout,
-        ).raise_for_status()
+        self._request("PUT", f"bookmarks/{_quote_path_id(bookmark)}/add", json=docs)
 
     def remove_from_bookmark(self, bookmark: str, docs: list[dict[str, Any]]) -> None:
-        """Remove docs do bookmark. docs: [{"source": str, "id": int}]."""
-        self._session.put(
-            f"{self.base_url}/bookmarks/{quote(bookmark)}/remove",
-            json=docs,
-            timeout=self.timeout,
-        ).raise_for_status()
+        """Remove docs do bookmark. docs: [{"source": str, "id": int}].
+
+        Args:
+            bookmark: nome do bookmark.
+            docs: pares {source, id} a remover.
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
+        """
+        self._request(
+            "PUT", f"bookmarks/{_quote_path_id(bookmark)}/remove", json=docs
+        )
 
     def rename_bookmark(self, old_name: str, new_name: str) -> None:
-        """Renomeia um bookmark."""
-        self._session.put(
-            f"{self.base_url}/bookmarks/{quote(old_name)}/rename/{quote(new_name)}",
-            timeout=self.timeout,
-        ).raise_for_status()
+        """Renomeia um bookmark.
+
+        Args:
+            old_name: nome atual.
+            new_name: nome novo.
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
+        """
+        self._request(
+            "PUT",
+            f"bookmarks/{_quote_path_id(old_name)}"
+            f"/rename/{_quote_path_id(new_name)}",
+        )
 
     def delete_bookmark(self, name: str) -> None:
-        """Exclui um bookmark (não os documentos indexados)."""
-        self._session.delete(
-            f"{self.base_url}/bookmarks/{quote(name)}", timeout=self.timeout
-        ).raise_for_status()
+        """Exclui um bookmark (não os documentos indexados).
+
+        Args:
+            name: nome do bookmark.
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
+        """
+        self._request("DELETE", f"bookmarks/{_quote_path_id(name)}")
 
     def get_document_content(
         self, source_id: str, doc_id: int
@@ -128,12 +657,24 @@ class IPEDClient:
 
         O download faz streaming via response.iter_content(). Body vazio
         (Content-Length: 0) = doc sem arquivo.
+
+        Args:
+            source_id: source do doc.
+            doc_id: id do doc.
+
+        Returns:
+            (filename, resposta em streaming).
+
+        Raises:
+            IpedError: falha de rede/HTTP antes do streaming começar.
         """
-        resp = self._session.get(
-            f"{self.base_url}/sources/{source_id}/docs/{doc_id}/content",
-            timeout=(self.timeout, _CONTENT_READ_TIMEOUT),
+        resp = self._request(
+            "GET",
+            _doc_path(source_id, doc_id, "content"),
+            timeout=self._download_timeout,
+            source_id=source_id,
+            doc_id=doc_id,
         )
-        resp.raise_for_status()
         filename = ""
         cd = resp.headers.get("Content-Disposition", "")
         if 'filename="' in cd:
@@ -141,37 +682,103 @@ class IPEDClient:
         return filename, resp
 
     def get_document_text(
-        self, source_id: str, doc_id: int, max_bytes: int = _TEXT_READ_CAP
-    ) -> tuple[str, int, bool]:
-        """→ (text, total_chars, capped). Texto extraído do doc (endpoint /text).
+        self, source_id: str, doc_id: int, max_bytes: int | None = None
+    ) -> TextResult:
+        """Texto extraído do doc (endpoint /text) como estado, não exceção.
 
-        O stream é chunked (sem Content-Length): lê até max_bytes para contar o
-        total. capped=True → total_chars é piso (o texto real é maior).
+        Status como dado (DESIGN 08 / M-8): no jar-alvo, doc sem texto
+        extraído responde HTTP 500 — WONT_FIX permanente do fork (P2-5).
+        Este cliente traduz o 500 desta rota em ``status=no_text`` (sem
+        exceção); por isso o 500 de /text também não é re-tentado
+        (``retry_server_errors=False`` — estado determinístico, mesmo
+        raciocínio do `search` no M-3/AC4). O cap de leitura é
+        ``config.TEXT_CAP_BYTES`` (env ``IPED_MCP_TEXT_CAP``, default 10 MB).
+
+        O stream é chunked (sem Content-Length): lê até ``max_bytes`` para
+        contar o total. ``capped=True`` → ``total_chars``/``total_bytes``
+        são piso (o texto real é maior).
+
+        Args:
+            source_id: source do doc.
+            doc_id: id do doc.
+            max_bytes: teto de leitura em bytes; None = ``config.TEXT_CAP_BYTES``
+                (resolvido na chamada, respeita reload do config).
+
+        Returns:
+            ``TextResult`` com texto, estado (``ok``/``no_text``) e o flag
+            ``capped`` — presente em TODA resposta bem-sucedida.
+
+        Raises:
+            ResourceNotFoundError: HTTP 404 (policy M-2 intacta; ex.: source
+                inexistente).
+            IpedError: falha de rede/timeout/HTTP exceto o 500 desta rota.
         """
-        resp = self._session.get(
-            f"{self.base_url}/sources/{source_id}/docs/{doc_id}/text",
-            timeout=(self.timeout, _CONTENT_READ_TIMEOUT),
-        )
-        resp.raise_for_status()
+        cap = config.TEXT_CAP_BYTES if max_bytes is None else max_bytes
+        try:
+            resp = self._request(
+                "GET",
+                _doc_path(source_id, doc_id, "text"),
+                timeout=self._text_timeout,
+                source_id=source_id,
+                doc_id=doc_id,
+                retry_server_errors=False,
+            )
+        except ServerError as exc:
+            # Gancho .response do M-2: o corpo do 500 fica disponível para
+            # diagnóstico (TO_VERIFY: 500-sem-texto × 500-erro-interno são
+            # indistinguíveis no contrato do fork — aceito, P2-5).
+            body = exc.response.text[:200] if exc.response is not None else ""
+            logger.debug(
+                "/text %s/%s: HTTP %s → status no_text (corpo: %r)",
+                source_id,
+                doc_id,
+                exc.status_code,
+                body,
+            )
+            return TextResult(
+                text="",
+                total_chars=0,
+                capped=False,
+                status=TEXT_STATUS_NO_TEXT,
+                total_bytes=0,
+            )
         chunks: list[bytes] = []
         total = 0
         capped = False
-        for chunk in resp.iter_content(chunk_size=65536):
+        for chunk in resp.iter_content(chunk_size=_TEXT_CHUNK_SIZE):
             if not chunk:
                 continue
             chunks.append(chunk)
             total += len(chunk)
-            if total >= max_bytes:
+            if total >= cap:
                 capped = True
                 break
         text = b"".join(chunks).decode("utf-8", errors="replace")
-        return text, len(text), capped
+        return TextResult(
+            text=text,
+            total_chars=len(text),
+            capped=capped,
+            status=TEXT_STATUS_OK,
+            total_bytes=total,
+        )
 
     def get_document_thumb(self, source_id: str, doc_id: int) -> requests.Response:
-        """→ Response bruto da thumbnail (JPEG). Body vazio = doc sem imagem."""
-        resp = self._session.get(
-            f"{self.base_url}/sources/{source_id}/docs/{doc_id}/thumb",
-            timeout=(self.timeout, _CONTENT_READ_TIMEOUT),
+        """→ Response bruto da thumbnail (JPEG). Body vazio = doc sem imagem.
+
+        Args:
+            source_id: source do doc.
+            doc_id: id do doc.
+
+        Returns:
+            Resposta com os bytes da thumbnail.
+
+        Raises:
+            IpedError: falha de rede/HTTP (taxonomia `iped_mcp.errors`).
+        """
+        return self._request(
+            "GET",
+            _doc_path(source_id, doc_id, "thumb"),
+            timeout=self._download_timeout,
+            source_id=source_id,
+            doc_id=doc_id,
         )
-        resp.raise_for_status()
-        return resp

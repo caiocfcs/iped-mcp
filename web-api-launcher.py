@@ -17,11 +17,26 @@ import tempfile
 import time
 from typing import Any
 
-DEFAULT_HOST = "0.0.0.0"
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 1234
+
+# Enderecos que mantem a WebAPI restrita a propria maquina (M-5).
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+LOOPBACK_V4_PREFIX = "127."
+
+EXPOSURE_WARNING = (
+    "[AVISO] WebAPI sem autenticacao acessivel na rede: o host {host!r} "
+    "nao e de loopback e qualquer maquina da rede podera consultar os "
+    "dados forenses expostos nestas portas."
+)
 
 
 def parse_args() -> argparse.Namespace:
+    """Interpreta os argumentos da linha de comando do launcher.
+
+    Returns:
+        Namespace com ``root``, ``sources``, ``host`` e ``start_port``.
+    """
     parser = argparse.ArgumentParser(
         description="Sobe uma instancia da IPED Web API para cada source do multicases.json."
     )
@@ -40,7 +55,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--host",
         default=DEFAULT_HOST,
-        help=f"Endereco de escuta (padrao: {DEFAULT_HOST}).",
+        help=(
+            f"Endereco de escuta (padrao: {DEFAULT_HOST}, somente esta "
+            "maquina). Enderecos externos exigem flag explicita e emitem "
+            "aviso, porque a WebAPI nao possui autenticacao."
+        ),
     )
     parser.add_argument(
         "--start-port",
@@ -68,6 +87,54 @@ def load_sources(path: Path) -> list[dict[str, Any]]:
         if not source.get("id") or not source.get("path"):
             raise SystemExit(f"ERRO: source #{index} deve conter 'id' e 'path'.")
     return data
+
+
+def is_loopback_host(host: str) -> bool:
+    """Indica se o endereco de escuta restringe a API ao proprio host.
+
+    Args:
+        host: Endereco de escuta informado em ``--host``.
+
+    Returns:
+        ``True`` para loopback (127.0.0.0/8, ``localhost``, ``::1``);
+        ``False`` para qualquer endereco que alcance outras maquinas.
+    """
+    normalized = host.strip().lower()
+    if normalized in LOOPBACK_HOSTS:
+        return True
+    return normalized.startswith(LOOPBACK_V4_PREFIX)
+
+
+def warn_if_exposed(host: str) -> None:
+    """Imprime aviso destacado quando o host expoe a API sem autenticacao.
+
+    Args:
+        host: Endereco de escuta efetivo apos o parsing dos argumentos.
+    """
+    if not is_loopback_host(host):
+        print(EXPOSURE_WARNING.format(host=host), file=sys.stderr)
+
+
+def build_server_command(
+    java: Path, jar: Path, host: str, port: int, sources_file: Path
+) -> list[str]:
+    """Monta a linha de comando do JVM de uma instancia da Web API.
+
+    Args:
+        java: Executavel do JRE embutido (``jre/bin/java``).
+        jar: Arquivo ``lib/iped-webapi.jar``.
+        host: Endereco de escuta repassado ao JAR.
+        port: Porta atribuida a esta source.
+        sources_file: JSON temporario com a unica source da instancia.
+
+    Returns:
+        Lista de argumentos para ``subprocess.Popen``.
+    """
+    return [
+        str(java), "-jar", str(jar),
+        f"--host={host}", f"--port={port}",
+        f"--sources={sources_file}",
+    ]
 
 
 def port_is_available(host: str, port: int) -> bool:
@@ -211,7 +278,13 @@ class ServerManager:
 
 
 def main() -> int:
+    """Valida o ambiente, sobe um JVM por source e monitora os servidores.
+
+    Returns:
+        Codigo de saida do launcher (0 = encerramento normal).
+    """
     args = parse_args()
+    warn_if_exposed(args.host)
     root = args.root.expanduser().resolve()
     sources_file = args.sources.expanduser()
     if not sources_file.is_absolute():
@@ -256,11 +329,9 @@ def main() -> int:
                 json.dumps([source], ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
-            command = [
-                str(java), "-jar", str(jar),
-                f"--host={args.host}", f"--port={port}",
-                f"--sources={single_source}",
-            ]
+            command = build_server_command(
+                java, jar, args.host, port, single_source
+            )
             popen_options: dict[str, Any] = {"cwd": str(root)}
             if os.name == "nt":
                 popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP

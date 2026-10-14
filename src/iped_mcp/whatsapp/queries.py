@@ -122,11 +122,25 @@ def build_conversation_query(number: str) -> str:
     )
 
 
+def build_date_range_query(start: str, end: str) -> str:
+    r"""Cláusula de range de `Communication\:Date` (F2.6).
+
+    Args:
+        start: extremo inicial inclusivo do range (ISO UTC).
+        end: extremo final inclusivo; date-only trunca o último dia no
+            servidor — use `T23:59:59Z` para cobrir o dia inteiro.
+
+    Returns:
+        Cláusula Lucene `Communication\:Date:[<start> TO <end>]`.
+    """
+    return f"Communication\\:Date:[{start} TO {end}]"
+
+
 def build_conversation_window_query(number: str, start: str, end: str) -> str:
     """Conversa privada exata restrita a uma janela de `Communication:Date`."""
     return (
         f"{build_conversation_query(number)} AND "
-        f"Communication\\:Date:[{start} TO {end}]"
+        f"{build_date_range_query(start, end)}"
     )
 
 
@@ -165,6 +179,11 @@ def build_pdf_query() -> str:
 def build_account_query() -> str:
     """Doc da conta do dono (1 por source; valor entre aspas — F1.11)."""
     return 'contentType:"application/x-whatsapp-account"'
+
+
+def build_contacts_query() -> str:
+    """Docs de contatos da conta (padrão `name:Contact`; F1.7)."""
+    return "accountType:WhatsApp AND name:Contact"
 
 
 def build_profile_query(number: str) -> str:
